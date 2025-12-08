@@ -1,0 +1,14 @@
+ampcid.google.be
+sandbox.google.be
+id.google.be
+consent.google.be
+privacy.google.be
+clients6.google.be
+www.google.be
+adwords.google.be
+cctldtest.google.be
+cse.google.be
+translate.google.be
+shopping.google.be
+adssettings.google.be
+ww.google.be

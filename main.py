@@ -16,6 +16,8 @@ Features:
 """
 
 import argparse
+import csv
+import io
 import json
 import os
 import shutil
@@ -23,12 +25,13 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 # ====================== CONFIG ======================
 
@@ -37,13 +40,20 @@ STATE_FILE = DATA_DIR / "state.json"
 HTML_DASHBOARD_FILE = DATA_DIR / "dashboard.html"
 LOCK_FILE = DATA_DIR / ".lock"
 CONFIG_FILE = DATA_DIR / "config.json"
+HISTORY_DIR = DATA_DIR / "history"
 
 DEFAULT_INTERVAL = 30
 HTML_REFRESH_SECONDS = DEFAULT_INTERVAL  # default; can be overridden
+MAX_JOB_LOG_LINES = 400
+MAX_JOB_LOG_LINE_LENGTH = 500
 
 # Tool names (can be adjusted per OS if needed)
 TOOLS = {
     "amass": "amass",
+    "subfinder": "subfinder",
+    "assetfinder": "assetfinder",
+    "findomain": "findomain",
+    "sublist3r": "sublist3r",
     "ffuf": "ffuf",
     "httpx": "httpx",
     "nuclei": "nuclei",
@@ -52,6 +62,65 @@ TOOLS = {
 
 CONFIG_LOCK = threading.Lock()
 CONFIG: Dict[str, Any] = {}
+
+
+class ToolGate:
+    def __init__(self, limit: int):
+        self._limit = max(1, int(limit))
+        self._count = 0
+        self._cond = threading.Condition()
+
+    def acquire(self) -> None:
+        with self._cond:
+            while self._count >= self._limit:
+                self._cond.wait()
+            self._count += 1
+
+    def release(self) -> None:
+        with self._cond:
+            if self._count > 0:
+                self._count -= 1
+            self._cond.notify_all()
+
+    def update_limit(self, limit: int) -> None:
+        with self._cond:
+            self._limit = max(1, int(limit))
+            self._cond.notify_all()
+
+    def snapshot(self) -> Dict[str, int]:
+        with self._cond:
+            return {
+                "limit": self._limit,
+                "active": self._count,
+            }
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+
+
+TOOL_GATES: Dict[str, ToolGate] = {
+    "ffuf": ToolGate(1),
+    "nuclei": ToolGate(1),
+    "nikto": ToolGate(1),
+}
+JOB_QUEUE: deque = deque()
+MAX_RUNNING_JOBS = 1
+RUNNING_JOBS: Dict[str, Dict[str, Any]] = {}
+JOB_LOCK = threading.Lock()
+PIPELINE_STEPS = ["amass", "subfinder", "assetfinder", "findomain", "sublist3r", "ffuf", "httpx", "nuclei", "nikto"]
+STEP_PROGRESS = {
+    "pending": 0,
+    "queued": 0,
+    "running": 55,
+    "completed": 100,
+    "skipped": 0,
+    "error": 100,
+    "failed": 100,
+}
 
 
 # ================== UTILITIES =======================
@@ -63,6 +132,64 @@ def log(msg: str) -> None:
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def apply_concurrency_limits(cfg: Dict[str, Any]) -> None:
+    global MAX_RUNNING_JOBS
+    try:
+        MAX_RUNNING_JOBS = max(1, int(cfg.get("max_running_jobs", 1)))
+    except (TypeError, ValueError):
+        MAX_RUNNING_JOBS = 1
+    for tool in ("ffuf", "nuclei", "nikto"):
+        gate = TOOL_GATES.setdefault(tool, ToolGate(1))
+        limit = cfg.get(f"max_parallel_{tool}", 1)
+        try:
+            limit_int = max(1, int(limit))
+        except (TypeError, ValueError):
+            limit_int = 1
+        gate.update_limit(limit_int)
+    schedule_jobs()
+
+
+def is_subdomain_input(domain: str) -> bool:
+    if not domain:
+        return False
+    parts = [part for part in domain.split(".") if part]
+    return len(parts) >= 3
+
+
+def job_log_append(domain: Optional[str], text: Optional[str], source: str = "system") -> None:
+    if not domain or not text:
+        return
+    timestamp = datetime.now(timezone.utc).isoformat()
+    lines = str(text).splitlines() or [str(text)]
+    entries_to_store = []
+    for line in lines[-200:]:
+        clean = line.strip("\n")
+        if not clean:
+            continue
+        entry = {
+            "ts": timestamp,
+            "source": source,
+            "text": clean[:MAX_JOB_LOG_LINE_LENGTH],
+        }
+        entries_to_store.append(entry)
+        append_domain_history(domain, entry)
+
+    if not entries_to_store:
+        return
+
+    with JOB_LOCK:
+        job = RUNNING_JOBS.get(domain)
+        if not job:
+            return
+        entries = job.setdefault("logs", [])
+        entries.extend(entries_to_store)
+        if len(entries) > MAX_JOB_LOG_LINES:
+            job["logs"] = entries[-MAX_JOB_LOG_LINES:]
+        else:
+            job["logs"] = entries
 
 
 def default_config() -> Dict[str, Any]:
@@ -74,6 +201,19 @@ def default_config() -> Dict[str, Any]:
         "default_interval": DEFAULT_INTERVAL,
         "default_wordlist": "",
         "skip_nikto_by_default": False,
+        "enable_amass": True,
+        "amass_timeout": 600,
+        "enable_subfinder": True,
+        "enable_assetfinder": True,
+        "enable_findomain": True,
+        "enable_sublist3r": True,
+        "subfinder_threads": 32,
+        "assetfinder_threads": 10,
+        "findomain_threads": 40,
+        "max_parallel_ffuf": 1,
+        "max_parallel_nuclei": 1,
+        "max_parallel_nikto": 1,
+        "max_running_jobs": 1,
     }
 
 
@@ -86,6 +226,7 @@ def save_config(cfg: Dict[str, Any]) -> None:
     with CONFIG_LOCK:
         CONFIG.clear()
         CONFIG.update(cfg)
+    apply_concurrency_limits(cfg)
 
 
 def load_config() -> Dict[str, Any]:
@@ -103,10 +244,10 @@ def load_config() -> Dict[str, Any]:
             log(f"Error loading config.json: {e}")
     else:
         save_config(cfg)
-        return cfg
     with CONFIG_LOCK:
         CONFIG.clear()
         CONFIG.update(cfg)
+    apply_concurrency_limits(cfg)
     return dict(CONFIG)
 
 
@@ -157,6 +298,39 @@ def update_config_settings(values: Dict[str, Any]) -> Tuple[bool, str, Dict[str,
         if cfg.get("skip_nikto_by_default") != new_skip:
             cfg["skip_nikto_by_default"] = new_skip
             changed = True
+
+    if "enable_amass" in values:
+        new_amass = bool_from_value(values.get("enable_amass"), cfg.get("enable_amass", True))
+        if cfg.get("enable_amass", True) != new_amass:
+            cfg["enable_amass"] = new_amass
+            changed = True
+
+    for key in ["enable_subfinder", "enable_assetfinder", "enable_findomain", "enable_sublist3r"]:
+        if key in values:
+            new_value = bool_from_value(values.get(key), cfg.get(key, True))
+            if cfg.get(key, True) != new_value:
+                cfg[key] = new_value
+                changed = True
+
+    concurrency_fields = {
+        "max_running_jobs": "Max concurrent jobs",
+        "max_parallel_ffuf": "FFUF parallel slots",
+        "max_parallel_nuclei": "Nuclei parallel slots",
+        "max_parallel_nikto": "Nikto parallel slots",
+        "subfinder_threads": "Subfinder threads",
+        "assetfinder_threads": "Assetfinder threads",
+        "findomain_threads": "Findomain threads",
+        "amass_timeout": "Amass timeout (seconds)",
+    }
+    for field, label in concurrency_fields.items():
+        if field in values:
+            try:
+                new_limit = max(1, int(values.get(field)))
+            except (TypeError, ValueError):
+                return False, f"{label} must be an integer >= 1.", cfg
+            if cfg.get(field, 1) != new_limit:
+                cfg[field] = new_limit
+                changed = True
 
     if changed:
         save_config(cfg)
@@ -272,11 +446,13 @@ def ensure_tool_installed(tool: str) -> bool:
 
     # Try go install for some known tools
     try:
-        if shutil.which("go") and tool in {"amass", "httpx", "nuclei"}:
+        if shutil.which("go") and tool in {"amass", "httpx", "nuclei", "subfinder", "assetfinder"}:
             go_pkgs = {
                 "amass": "github.com/owasp-amass/amass/v3/...@latest",
                 "httpx": "github.com/projectdiscovery/httpx/cmd/httpx@latest",
                 "nuclei": "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest",
+                "subfinder": "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
+                "assetfinder": "github.com/tomnomnom/assetfinder@latest",
             }
             pkg = go_pkgs[tool]
             log(f"Trying: go install {pkg}")
@@ -366,46 +542,75 @@ def ensure_amass_config_interactive() -> None:
 
 # ================== PIPELINE STEPS ==================
 
-def run_subprocess(cmd, outfile=None):
-    log("Running: " + " ".join(cmd))
+def run_subprocess(
+    cmd,
+    outfile: Optional[Path] = None,
+    *,
+    job_domain: Optional[str] = None,
+    step: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+    timeout: Optional[int] = None,
+) -> bool:
+    display_cmd = " ".join(cmd)
+    log(f"Running: {display_cmd}")
+    if job_domain:
+        job_log_append(job_domain, f"$ {display_cmd}", source=step or "command")
     try:
-        if outfile:
-            out = open(outfile, "w", encoding="utf-8")
-        else:
-            out = subprocess.DEVNULL
+        merged_env = os.environ.copy()
+        if env:
+            merged_env.update({k: str(v) for k, v in env.items()})
 
         result = subprocess.run(
             cmd,
-            stdout=out,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            check=False
+            check=False,
+            env=merged_env,
+            timeout=timeout,
         )
 
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+
         if outfile:
-            out.close()
+            try:
+                with open(outfile, "w", encoding="utf-8") as f:
+                    f.write(stdout)
+            except Exception as file_err:
+                log(f"Error writing {outfile}: {file_err}")
+
+        if job_domain:
+            if stdout.strip():
+                job_log_append(job_domain, stdout, source=step or cmd[0])
+            if stderr.strip():
+                job_log_append(job_domain, stderr, source=f"{(step or cmd[0]).upper()} stderr")
 
         if result.returncode != 0:
-            stderr_preview = (result.stderr or "")[:500]
+            stderr_preview = (stderr or "")[:500]
             log(
                 f"Command failed (return code {result.returncode}): "
-                + " ".join(cmd)
+                + display_cmd
                 + "\nstderr: " + stderr_preview
             )
             return False
 
     except FileNotFoundError:
         log(f"Command not found: {cmd[0]}")
+        if job_domain:
+            job_log_append(job_domain, f"Command not found: {cmd[0]}", source=step or "system")
         return False
 
     except Exception as e:
-        log("Error running command " + " ".join(cmd) + f": {e}")
+        log("Error running command " + display_cmd + f": {e}")
+        if job_domain:
+            job_log_append(job_domain, f"Error: {e}", source=step or "system")
         return False
 
     return True
 
 
-def amass_enum(domain: str) -> Path:
+def amass_enum(domain: str, config: Optional[Dict[str, Any]] = None, job_domain: Optional[str] = None) -> Path:
     """
     Run Amass enum with JSON output and return path to JSON file.
     """
@@ -416,13 +621,24 @@ def amass_enum(domain: str) -> Path:
 
     out_base = DATA_DIR / f"amass_{domain}"
     out_json = out_base.with_suffix(".json")
+    extra_args = []
+    timeout = None
+    if config:
+        try:
+            timeout = int(config.get("amass_timeout"))
+            if timeout <= 0:
+                timeout = None
+        except (TypeError, ValueError):
+            timeout = None
+        if config.get("amass_passive"):
+            extra_args.append("-passive")
     cmd = [
         TOOLS["amass"],
         "enum",
         "-d", domain,
         "-oA", str(out_base),
-    ]
-    success = run_subprocess(cmd)
+    ] + extra_args
+    success = run_subprocess(cmd, job_domain=job_domain, step="amass", timeout=timeout)
     return out_json if success and out_json.exists() else None
 
 
@@ -448,7 +664,344 @@ def parse_amass_json(json_path: Path) -> List[str]:
     return sorted(subs)
 
 
-def ffuf_bruteforce(domain: str, wordlist: str) -> List[str]:
+def read_lines_file(path: Path) -> List[str]:
+    if not path or not path.exists():
+        return []
+    lines = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    lines.append(line.lower())
+    except Exception as exc:
+        log(f"Error reading {path}: {exc}")
+    return lines
+
+
+def amass_collect_subdomains(domain: str, config: Optional[Dict[str, Any]] = None, job_domain: Optional[str] = None) -> List[str]:
+    amass_json = amass_enum(domain, config=config, job_domain=job_domain)
+    return parse_amass_json(amass_json)
+
+
+def subfinder_enum(domain: str, config: Optional[Dict[str, Any]] = None, job_domain: Optional[str] = None) -> List[str]:
+    if not ensure_tool_installed("subfinder"):
+        return []
+    out_path = DATA_DIR / f"subfinder_{domain}.txt"
+    threads = 32
+    if config:
+        try:
+            threads = max(1, int(config.get("subfinder_threads", threads)))
+        except (TypeError, ValueError):
+            threads = 32
+    cmd = [
+        TOOLS["subfinder"],
+        "-silent",
+        "-d", domain,
+        "-t", str(threads),
+        "-o", str(out_path),
+    ]
+    success = run_subprocess(cmd, outfile=out_path, job_domain=job_domain, step="subfinder")
+    return read_lines_file(out_path) if success else []
+
+
+def assetfinder_enum(domain: str, config: Optional[Dict[str, Any]] = None, job_domain: Optional[str] = None) -> List[str]:
+    if not ensure_tool_installed("assetfinder"):
+        return []
+    out_path = DATA_DIR / f"assetfinder_{domain}.txt"
+    threads = 10
+    if config:
+        try:
+            threads = max(1, int(config.get("assetfinder_threads", threads)))
+        except (TypeError, ValueError):
+            threads = 10
+    cmd = [
+        TOOLS["assetfinder"],
+        "--subs-only",
+        domain,
+    ]
+    success = run_subprocess(
+        cmd,
+        outfile=out_path,
+        job_domain=job_domain,
+        step="assetfinder",
+        env={"GOMAXPROCS": str(threads)},
+    )
+    return read_lines_file(out_path) if success else []
+
+
+def findomain_enum(domain: str, config: Optional[Dict[str, Any]] = None, job_domain: Optional[str] = None) -> List[str]:
+    if not ensure_tool_installed("findomain"):
+        return []
+    out_path = DATA_DIR / f"findomain_{domain}.txt"
+    threads = 40
+    if config:
+        try:
+            threads = max(1, int(config.get("findomain_threads", threads)))
+        except (TypeError, ValueError):
+            threads = 40
+    cmd = [
+        TOOLS["findomain"],
+        "--target", domain,
+        "--threads", str(threads),
+        "--quiet",
+        "--output", str(out_path),
+    ]
+    success = run_subprocess(cmd, outfile=out_path, job_domain=job_domain, step="findomain")
+    return read_lines_file(out_path) if success else []
+
+
+def sublist3r_enum(domain: str, job_domain: Optional[str] = None) -> List[str]:
+    if not ensure_tool_installed("sublist3r"):
+        return []
+    out_path = DATA_DIR / f"sublist3r_{domain}.txt"
+    cmd = [
+        TOOLS["sublist3r"],
+        "-d", domain,
+        "-o", str(out_path),
+    ]
+    success = run_subprocess(cmd, outfile=out_path, job_domain=job_domain, step="sublist3r")
+    return read_lines_file(out_path) if success else []
+
+
+def harvest_enumerator_outputs(
+    domain: str,
+    config: Dict[str, Any],
+    seen_cache: Dict[str, set],
+    job_domain: Optional[str] = None,
+) -> bool:
+    state = None
+    added = False
+
+    def ensure_state():
+        nonlocal state
+        if state is None:
+            state = load_state()
+        return state
+
+    def process(name: str, enabled: bool, path: Path, parser):
+        nonlocal added
+        if not enabled:
+            return
+        if not path.exists():
+            return
+        try:
+            subs = parser(path)
+        except Exception as exc:
+            log(f"Error parsing {path}: {exc}")
+            return
+        cache = seen_cache.setdefault(name, set())
+        new_items = [s for s in subs if s not in cache]
+        if not new_items:
+            return
+        cache.update(new_items)
+        add_subdomains_to_state(ensure_state(), domain, new_items, name)
+        job_log_append(job_domain, f"{name} added {len(new_items)} new subdomains.", name)
+        added = True
+
+    amass_enabled = config.get("enable_amass", True)
+    process(
+        "amass",
+        amass_enabled,
+        DATA_DIR / f"amass_{domain}.json",
+        parse_amass_json,
+    )
+    process(
+        "subfinder",
+        config.get("enable_subfinder", True),
+        DATA_DIR / f"subfinder_{domain}.txt",
+        read_lines_file,
+    )
+    process(
+        "assetfinder",
+        config.get("enable_assetfinder", True),
+        DATA_DIR / f"assetfinder_{domain}.txt",
+        read_lines_file,
+    )
+    process(
+        "findomain",
+        config.get("enable_findomain", True),
+        DATA_DIR / f"findomain_{domain}.txt",
+        read_lines_file,
+    )
+    process(
+        "sublist3r",
+        config.get("enable_sublist3r", True),
+        DATA_DIR / f"sublist3r_{domain}.txt",
+        read_lines_file,
+    )
+
+    if added and state is not None:
+        save_state(state)
+    return added
+
+
+def run_downstream_pipeline(
+    domain: str,
+    wordlist: Optional[str],
+    skip_nikto: bool,
+    interval: int,
+    job_domain: Optional[str],
+    enumerators_done_event: threading.Event,
+) -> None:
+    def update_step(step_name: str, status: Optional[str] = None,
+                    message: Optional[str] = None, progress: Optional[int] = None) -> None:
+        job_step_update(job_domain, step_name, status=status, message=message, progress=progress)
+
+    def wait_for_subdomains() -> List[str]:
+        while True:
+            state = load_state()
+            tgt = ensure_target_state(state, domain)
+            subs = sorted(tgt["subdomains"].keys())
+            if subs or enumerators_done_event.is_set():
+                return subs
+            time.sleep(5)
+
+    all_subs = wait_for_subdomains()
+    log(f"Total unique subdomains for {domain}: {len(all_subs)}")
+    subs_file = write_subdomains_file(domain, all_subs)
+
+    state = load_state()
+    flags = ensure_target_state(state, domain)["flags"]
+
+    # ---------- ffuf ----------
+    if not flags.get("ffuf_done"):
+        if not wordlist or (wordlist and not Path(wordlist).exists()):
+            log("ffuf wordlist not provided or not found; skipping ffuf brute-force.")
+            update_step("ffuf", status="skipped", message="Wordlist missing; ffuf skipped.", progress=0)
+        else:
+            log(f"=== ffuf brute-force for {domain} using {wordlist} ===")
+            update_step("ffuf", status="running", message=f"ffuf running with {wordlist}", progress=50)
+            if job_domain:
+                job_log_append(job_domain, "Waiting for ffuf slot...", "scheduler")
+            with TOOL_GATES["ffuf"]:
+                if job_domain:
+                    job_log_append(job_domain, "ffuf slot acquired.", "scheduler")
+                subs_ffuf = ffuf_bruteforce(domain, wordlist, job_domain=job_domain)
+            log(f"ffuf found {len(subs_ffuf)} vhost subdomains.")
+            add_subdomains_to_state(state, domain, subs_ffuf, "ffuf")
+            flags["ffuf_done"] = True
+            save_state(state)
+            update_step("ffuf", status="completed", message=f"ffuf found {len(subs_ffuf)} subdomains.", progress=100)
+    else:
+        update_step("ffuf", status="skipped", message="ffuf already completed for this target.", progress=0)
+
+    # ---------- httpx ----------
+    httpx_processed: set = set()
+    while True:
+        state = load_state()
+        flags = ensure_target_state(state, domain)["flags"]
+        all_subs = sorted(ensure_target_state(state, domain)["subdomains"].keys())
+        new_hosts = [s for s in all_subs if s not in httpx_processed]
+        if not flags.get("httpx_done") and httpx_processed == set():
+            log(f"=== httpx scan for {domain} ({len(all_subs)} hosts) ===")
+        if not new_hosts:
+            if enumerators_done_event.is_set():
+                flags["httpx_done"] = True
+                save_state(state)
+                update_step("httpx", status="completed", message="httpx scan finished.", progress=100)
+                break
+            time.sleep(5)
+            continue
+        update_step("httpx", status="running", message=f"httpx scanning {len(new_hosts)} new hosts", progress=40)
+        batch_file = write_subdomains_file(domain, new_hosts, suffix="_httpx_batch")
+        httpx_json = httpx_scan(batch_file, domain, job_domain=job_domain)
+        enrich_state_with_httpx(state, domain, httpx_json)
+        httpx_processed.update(new_hosts)
+        save_state(state)
+        try:
+            batch_file.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        if httpx_json:
+            job_log_append(job_domain, f"httpx scanned {len(new_hosts)} hosts.", "httpx")
+        else:
+            job_log_append(job_domain, "httpx batch failed.", "httpx")
+
+    # ---------- nuclei ----------
+    nuclei_processed: set = set()
+    while True:
+        state = load_state()
+        flags = ensure_target_state(state, domain)["flags"]
+        all_subs = sorted(ensure_target_state(state, domain)["subdomains"].keys())
+        new_hosts = [s for s in all_subs if s not in nuclei_processed]
+        if not flags.get("nuclei_done") and nuclei_processed == set():
+            log(f"=== nuclei scan for {domain} ({len(all_subs)} hosts) ===")
+        if not new_hosts:
+            if enumerators_done_event.is_set():
+                flags["nuclei_done"] = True
+                save_state(state)
+                update_step("nuclei", status="completed", message="nuclei scan finished.", progress=100)
+                break
+            time.sleep(5)
+            continue
+        update_step("nuclei", status="running", message=f"nuclei scanning {len(new_hosts)} new hosts", progress=40)
+        batch_file = write_subdomains_file(domain, new_hosts, suffix="_nuclei_batch")
+        if job_domain:
+            job_log_append(job_domain, "Waiting for nuclei slot...", "scheduler")
+        with TOOL_GATES["nuclei"]:
+            if job_domain:
+                job_log_append(job_domain, "nuclei slot acquired.", "scheduler")
+            nuclei_json = nuclei_scan(batch_file, domain, job_domain=job_domain)
+        enrich_state_with_nuclei(state, domain, nuclei_json)
+        nuclei_processed.update(new_hosts)
+        save_state(state)
+        try:
+            batch_file.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        if nuclei_json:
+            job_log_append(job_domain, f"nuclei processed {len(new_hosts)} hosts.", "nuclei")
+        else:
+            job_log_append(job_domain, "nuclei batch failed.", "nuclei")
+
+    state = load_state()
+    flags = ensure_target_state(state, domain)["flags"]
+    all_subs = sorted(ensure_target_state(state, domain)["subdomains"].keys())
+
+    # ---------- nikto ----------
+    nikto_processed: set = set()
+    if skip_nikto:
+        update_step("nikto", status="skipped", message="Nikto skipped per run options.", progress=0)
+    else:
+        while True:
+            state = load_state()
+            flags = ensure_target_state(state, domain)["flags"]
+            all_subs = sorted(ensure_target_state(state, domain)["subdomains"].keys())
+            new_hosts = [s for s in all_subs if s not in nikto_processed]
+            if not flags.get("nikto_done") and nikto_processed == set():
+                log(f"=== nikto scan for {domain} ({len(all_subs)} hosts) ===")
+            if not new_hosts:
+                if enumerators_done_event.is_set():
+                    flags["nikto_done"] = True
+                    save_state(state)
+                    update_step("nikto", status="completed", message="Nikto scan finished.", progress=100)
+                    break
+                time.sleep(5)
+                continue
+            update_step("nikto", status="running", message=f"Nikto scanning {len(new_hosts)} new hosts", progress=40)
+            if job_domain:
+                job_log_append(job_domain, "Waiting for Nikto slot...", "scheduler")
+            with TOOL_GATES["nikto"]:
+                if job_domain:
+                    job_log_append(job_domain, "Nikto slot acquired.", "scheduler")
+                nikto_json = nikto_scan(new_hosts, domain, job_domain=job_domain)
+            enrich_state_with_nikto(state, domain, nikto_json)
+            nikto_processed.update(new_hosts)
+            save_state(state)
+            if nikto_json:
+                job_log_append(job_domain, f"Nikto scanned {len(new_hosts)} hosts.", "nikto")
+            else:
+                job_log_append(job_domain, "Nikto batch failed.", "nikto")
+
+    log("Pipeline finished for this run.")
+
+
+def ffuf_bruteforce(domain: str, wordlist: str, job_domain: Optional[str] = None) -> List[str]:
     """
     Use ffuf to brute-force vhosts via Host header.
     This is HTTP-based vhost brute, not pure DNS brute, but still useful.
@@ -460,6 +1013,7 @@ def ffuf_bruteforce(domain: str, wordlist: str) -> List[str]:
     # NOTE: user can tune -mc, -fs, etc to avoid wildcard noise.
     cmd = [
         TOOLS["ffuf"],
+        "-v",
         "-u", f"http://{domain}",
         "-H", "Host: FUZZ." + domain,
         "-w", wordlist,
@@ -467,7 +1021,7 @@ def ffuf_bruteforce(domain: str, wordlist: str) -> List[str]:
         "-o", str(out_json),
         "-mc", "200,301,302,403,401"
     ]
-    success = run_subprocess(cmd)
+    success = run_subprocess(cmd, job_domain=job_domain, step="ffuf")
     if not success or not out_json.exists():
         return []
 
@@ -485,18 +1039,20 @@ def ffuf_bruteforce(domain: str, wordlist: str) -> List[str]:
     return sorted(subs)
 
 
-def write_subdomains_file(domain: str, subs: List[str]) -> Path:
-    out_path = DATA_DIR / f"subs_{domain}.txt"
+def write_subdomains_file(domain: str, subs: List[str], suffix: Optional[str] = None) -> Path:
+    sanitized = sorted(set(subs))
+    out_name = f"subs_{domain}{suffix or ''}.txt"
+    out_path = DATA_DIR / out_name
     try:
         with open(out_path, "w", encoding="utf-8") as f:
-            for s in sorted(set(subs)):
+            for s in sanitized:
                 f.write(s + "\n")
     except Exception as e:
         log(f"Error writing subdomains file: {e}")
     return out_path
 
 
-def httpx_scan(subs_file: Path, domain: str) -> Path:
+def httpx_scan(subs_file: Path, domain: str, job_domain: Optional[str] = None) -> Path:
     if not ensure_tool_installed("httpx"):
         return None
     out_json = DATA_DIR / f"httpx_{domain}.json"
@@ -507,13 +1063,13 @@ def httpx_scan(subs_file: Path, domain: str) -> Path:
         "-o", str(out_json),
         "-timeout", "10",
         "-follow-redirects",
-        "-silent",
+        "-v",
     ]
-    success = run_subprocess(cmd)
+    success = run_subprocess(cmd, job_domain=job_domain, step="httpx")
     return out_json if success and out_json.exists() else None
 
 
-def nuclei_scan(subs_file: Path, domain: str) -> Path:
+def nuclei_scan(subs_file: Path, domain: str, job_domain: Optional[str] = None) -> Path:
     if not ensure_tool_installed("nuclei"):
         return None
     out_json = DATA_DIR / f"nuclei_{domain}.json"
@@ -522,13 +1078,13 @@ def nuclei_scan(subs_file: Path, domain: str) -> Path:
         "-l", str(subs_file),
         "-json",
         "-o", str(out_json),
-        "-silent",
+        "-v",
     ]
-    success = run_subprocess(cmd)
+    success = run_subprocess(cmd, job_domain=job_domain, step="nuclei")
     return out_json if success and out_json.exists() else None
 
 
-def nikto_scan(subs: List[str], domain: str) -> Path:
+def nikto_scan(subs: List[str], domain: str, job_domain: Optional[str] = None) -> Path:
     if not ensure_tool_installed("nikto"):
         return None
     out_json = DATA_DIR / f"nikto_{domain}.json"
@@ -539,10 +1095,13 @@ def nikto_scan(subs: List[str], domain: str) -> Path:
         cmd = [
             TOOLS["nikto"],
             "-h", target,
+            "-Display", "V",
             "-Format", "json",
             "-output", "-",
         ]
         log(f"Running nikto against {target}")
+        if job_domain:
+            job_log_append(job_domain, f"Nikto scanning {target}", source="nikto")
         try:
             proc = subprocess.run(
                 cmd,
@@ -553,9 +1112,13 @@ def nikto_scan(subs: List[str], domain: str) -> Path:
             )
             if proc.returncode != 0:
                 log(f"Nikto failed for {host}: {proc.stderr[:300]}")
+                if job_domain and proc.stderr:
+                    job_log_append(job_domain, proc.stderr, source="nikto stderr")
                 continue
             # Nikto sometimes outputs multiple JSON objects; attempt to parse leniently
             for line in proc.stdout.splitlines():
+                if job_domain:
+                    job_log_append(job_domain, line, source="nikto")
                 line = line.strip()
                 if not line:
                     continue
@@ -589,6 +1152,10 @@ def ensure_target_state(state: Dict[str, Any], domain: str) -> Dict[str, Any]:
         "subdomains": {},
         "flags": {
             "amass_done": False,
+            "subfinder_done": False,
+            "assetfinder_done": False,
+            "findomain_done": False,
+            "sublist3r_done": False,
             "ffuf_done": False,
             "httpx_done": False,
             "nuclei_done": False,
@@ -598,7 +1165,8 @@ def ensure_target_state(state: Dict[str, Any], domain: str) -> Dict[str, Any]:
     # Normalize missing keys
     tgt.setdefault("subdomains", {})
     tgt.setdefault("flags", {})
-    for k in ["amass_done", "ffuf_done", "httpx_done", "nuclei_done", "nikto_done"]:
+    for k in ["amass_done", "subfinder_done", "assetfinder_done", "findomain_done", "sublist3r_done",
+              "ffuf_done", "httpx_done", "nuclei_done", "nikto_done"]:
         tgt["flags"].setdefault(k, False)
     return tgt
 
@@ -781,6 +1349,10 @@ def generate_html_dashboard(state: Optional[Dict[str, Any]] = None) -> None:
             "<p>"
             f"<span class='badge'>Subdomains: {len(subs)}</span>"
             f"<span class='badge'>Amass: {'✅' if flags.get('amass_done') else '⏳'}</span>"
+            f"<span class='badge'>Subfinder: {'✅' if flags.get('subfinder_done') else '⏳'}</span>"
+            f"<span class='badge'>Assetfinder: {'✅' if flags.get('assetfinder_done') else '⏳'}</span>"
+            f"<span class='badge'>Findomain: {'✅' if flags.get('findomain_done') else '⏳'}</span>"
+            f"<span class='badge'>Sublist3r: {'✅' if flags.get('sublist3r_done') else '⏳'}</span>"
             f"<span class='badge'>ffuf: {'✅' if flags.get('ffuf_done') else '⏳'}</span>"
             f"<span class='badge'>httpx: {'✅' if flags.get('httpx_done') else '⏳'}</span>"
             f"<span class='badge'>nuclei: {'✅' if flags.get('nuclei_done') else '⏳'}</span>"
@@ -859,7 +1431,13 @@ def generate_html_dashboard(state: Optional[Dict[str, Any]] = None) -> None:
 
 # ================== MAIN PIPELINE ==================
 
-def run_pipeline(domain: str, wordlist: Optional[str], skip_nikto: bool = False, interval: int = DEFAULT_INTERVAL) -> None:
+def run_pipeline(
+    domain: str,
+    wordlist: Optional[str],
+    skip_nikto: bool = False,
+    interval: int = DEFAULT_INTERVAL,
+    job_domain: Optional[str] = None,
+) -> None:
     ensure_dirs()
     config = get_config()
     if not wordlist:
@@ -869,74 +1447,315 @@ def run_pipeline(domain: str, wordlist: Optional[str], skip_nikto: bool = False,
     global HTML_REFRESH_SECONDS
     HTML_REFRESH_SECONDS = max(5, interval)
 
-    # Load state
+    def update_step(step_name: str, status: Optional[str] = None,
+                    message: Optional[str] = None, progress: Optional[int] = None) -> None:
+        job_step_update(job_domain, step_name, status=status, message=message, progress=progress)
+
     state = load_state()
     tgt = ensure_target_state(state, domain)
     flags = tgt["flags"]
 
-    # ---------- Amass ----------
-    if not flags.get("amass_done"):
-        log(f"=== Amass enumeration for {domain} ===")
-        amass_json = amass_enum(domain)
-        if amass_json:
-            subs = parse_amass_json(amass_json)
-            log(f"Amass found {len(subs)} subdomains.")
-            add_subdomains_to_state(state, domain, subs, "amass")
-            flags["amass_done"] = True
-            save_state(state)
+    enumerators_done_event = threading.Event()
+    downstream_started = threading.Event()
+    downstream_thread_holder: Dict[str, threading.Thread] = {}
+    seen_cache = {
+        "amass": set(),
+        "subfinder": set(),
+        "assetfinder": set(),
+        "findomain": set(),
+        "sublist3r": set(),
+    }
+
+    def start_downstream_if_ready() -> None:
+        if downstream_started.is_set():
+            return
+        current_state = load_state()
+        sub_count = len(ensure_target_state(current_state, domain)["subdomains"])
+        if sub_count == 0 and not enumerators_done_event.is_set():
+            return
+        downstream_started.set()
+        t = threading.Thread(
+            target=run_downstream_pipeline,
+            args=(domain, wordlist, skip_nikto, interval, job_domain, enumerators_done_event),
+            daemon=True,
+        )
+        downstream_thread_holder["thread"] = t
+        t.start()
+
+    def flush_loop() -> None:
+        while not enumerators_done_event.is_set():
+            harvest_enumerator_outputs(domain, config, seen_cache, job_domain)
+            start_downstream_if_ready()
+            time.sleep(30)
+        harvest_enumerator_outputs(domain, config, seen_cache, job_domain)
+        start_downstream_if_ready()
+
+    flush_thread = threading.Thread(target=flush_loop, daemon=True)
+    flush_thread.start()
+
+    # ---------- Parallel Subdomain Enumerators ----------
+    subdomain_input = is_subdomain_input(domain)
+    if subdomain_input and not flags.get("amass_done"):
+        log(f"Detected subdomain input ({domain}); seeding pipeline with that host.")
+        add_subdomains_to_state(state, domain, [domain], "manual-input")
+        flags["amass_done"] = True
+        flags["subfinder_done"] = True
+        flags["assetfinder_done"] = True
+        save_state(state)
+        start_downstream_if_ready()
+
+    if subdomain_input:
+        update_step("amass", status="skipped", message="Input is a subdomain; Amass skipped.", progress=0)
+        update_step("subfinder", status="skipped", message="Input is a subdomain; Subfinder skipped.", progress=0)
+        update_step("assetfinder", status="skipped", message="Input is a subdomain; Assetfinder skipped.", progress=0)
+    else:
+        enumerator_specs = []
+        enable_subfinder = config.get("enable_subfinder", True)
+        enable_assetfinder = config.get("enable_assetfinder", True)
+        enable_findomain = config.get("enable_findomain", True)
+        enable_sublist3r = config.get("enable_sublist3r", True)
+
+        def maybe_add_enum(step_name: str, flag_key: str, desc: str, func, enabled: bool = True):
+            if not enabled:
+                update_step(step_name, status="skipped", message=f"{desc} disabled in settings.", progress=0)
+                return
+            if flags.get(flag_key):
+                update_step(step_name, status="skipped", message=f"{desc} already completed.", progress=0)
+                return
+            enumerator_specs.append((step_name, flag_key, desc, func))
+
+        if config.get("enable_amass", True):
+            maybe_add_enum(
+                "amass",
+                "amass_done",
+                "Amass",
+                lambda: amass_collect_subdomains(domain, config=config, job_domain=job_domain),
+            )
         else:
-            log("Amass enumeration skipped/failed; continuing.")
+            update_step("amass", status="skipped", message="Amass disabled in settings.", progress=0)
 
-    # ---------- ffuf ----------
-    if not flags.get("ffuf_done"):
-        if not wordlist or not Path(wordlist).exists():
-            log("ffuf wordlist not provided or not found; skipping ffuf brute-force.")
-        else:
-            log(f"=== ffuf brute-force for {domain} using {wordlist} ===")
-            subs_ffuf = ffuf_bruteforce(domain, wordlist)
-            log(f"ffuf found {len(subs_ffuf)} vhost subdomains.")
-            add_subdomains_to_state(state, domain, subs_ffuf, "ffuf")
-            flags["ffuf_done"] = True
-            save_state(state)
+        maybe_add_enum(
+            "subfinder",
+            "subfinder_done",
+            "Subfinder",
+            lambda: subfinder_enum(domain, config, job_domain=job_domain),
+            enable_subfinder,
+        )
+        maybe_add_enum(
+            "assetfinder",
+            "assetfinder_done",
+            "Assetfinder",
+            lambda: assetfinder_enum(domain, config, job_domain=job_domain),
+            enable_assetfinder,
+        )
+        maybe_add_enum(
+            "findomain",
+            "findomain_done",
+            "Findomain",
+            lambda: findomain_enum(domain, config, job_domain=job_domain),
+            enable_findomain,
+        )
+        maybe_add_enum(
+            "sublist3r",
+            "sublist3r_done",
+            "Sublist3r",
+            lambda: sublist3r_enum(domain, job_domain=job_domain),
+            enable_sublist3r,
+        )
 
-    # Dedup & write subdomains file
-    all_subs = sorted(ensure_target_state(state, domain)["subdomains"].keys())
-    log(f"Total unique subdomains for {domain}: {len(all_subs)}")
-    subs_file = write_subdomains_file(domain, all_subs)
+        if enumerator_specs:
+            enum_results: Dict[str, Optional[List[str]]] = {}
+            enum_errors: Dict[str, str] = {}
+            lock = threading.Lock()
 
-    # ---------- httpx ----------
-    if not flags.get("httpx_done"):
-        log(f"=== httpx scan for {domain} ({len(all_subs)} hosts) ===")
-        httpx_json = httpx_scan(subs_file, domain)
-        enrich_state_with_httpx(state, domain, httpx_json)
-        flags["httpx_done"] = True
-        save_state(state)
+            def enum_worker(name: str, func) -> None:
+                try:
+                    subs = func() or []
+                    with lock:
+                        enum_results[name] = subs
+                except Exception as exc:
+                    log(f"{name} enumeration failed: {exc}")
+                    job_log_append(job_domain, f"{name} failed: {exc}", name)
+                    with lock:
+                        enum_results[name] = None
+                        enum_errors[name] = str(exc)
 
-    # ---------- nuclei ----------
-    if not flags.get("nuclei_done"):
-        log(f"=== nuclei scan for {domain} ({len(all_subs)} hosts) ===")
-        nuclei_json = nuclei_scan(subs_file, domain)
-        enrich_state_with_nuclei(state, domain, nuclei_json)
-        flags["nuclei_done"] = True
-        save_state(state)
+            threads = []
+            for step_name, _, desc, func in enumerator_specs:
+                update_step(step_name, status="running", message=f"{desc} in progress…", progress=40)
+                t = threading.Thread(target=enum_worker, args=(step_name, func), daemon=True)
+                threads.append((step_name, t))
+                t.start()
 
-    # ---------- nikto ----------
-    if not skip_nikto and not flags.get("nikto_done"):
-        log(f"=== nikto scan for {domain} ({len(all_subs)} hosts) ===")
-        nikto_json = nikto_scan(all_subs, domain)
-        enrich_state_with_nikto(state, domain, nikto_json)
-        flags["nikto_done"] = True
-        save_state(state)
-    elif skip_nikto:
-        log("Skipping nikto because --skip-nikto was set.")
+            for _, t in threads:
+                t.join()
 
-    log("Pipeline finished for this run.")
+            for step_name, flag_key, desc, _ in enumerator_specs:
+                subs = enum_results.get(step_name)
+                if subs is None:
+                    update_step(step_name, status="error", message=f"{desc} failed: {enum_errors.get(step_name, 'Unknown error')}", progress=100)
+                    continue
+                current_state = load_state()
+                add_subdomains_to_state(current_state, domain, subs, step_name)
+                ensure_target_state(current_state, domain)["flags"][flag_key] = True
+                save_state(current_state)
+                job_log_append(job_domain, f"{desc} identified {len(subs)} subdomains.", step_name)
+                update_step(step_name, status="completed", message=f"{desc} found {len(subs)} subdomains.", progress=100)
+                start_downstream_if_ready()
+
+    enumerators_done_event.set()
+    flush_thread.join()
+    start_downstream_if_ready()
+    downstream_thread = downstream_thread_holder.get("thread")
+    if downstream_thread:
+        downstream_thread.join()
+    else:
+        run_downstream_pipeline(domain, wordlist, skip_nikto, interval, job_domain, enumerators_done_event)
+
+
+# ================== JOB SCHEDULER ==================
+
+def count_active_jobs_locked() -> int:
+    return sum(1 for job in RUNNING_JOBS.values()
+               if job.get("thread") and job["thread"].is_alive())
+
+
+def _start_job_thread(job: Dict[str, Any]) -> None:
+    domain = job["domain"]
+
+    def runner():
+        wordlist_path = job.get("wordlist") or None
+        skip_nikto = job.get("skip_nikto", False)
+        interval_val = job.get("interval", DEFAULT_INTERVAL)
+        try:
+            job_set_status(domain, "running", "Recon started.")
+            run_pipeline(
+                domain,
+                wordlist_path,
+                skip_nikto=skip_nikto,
+                interval=interval_val,
+                job_domain=domain,
+            )
+            with JOB_LOCK:
+                job_record = RUNNING_JOBS.get(domain)
+                had_errors = job_record_has_errors(job_record) if job_record else False
+            if had_errors:
+                job_set_status(domain, "completed_with_errors", "Recon finished with warnings.")
+            else:
+                job_set_status(domain, "completed", "Recon finished successfully.")
+        except Exception as exc:
+            log(f"Recon pipeline failed for {domain}: {exc}")
+            job_set_status(domain, "failed", f"Fatal error: {exc}")
+        finally:
+            with JOB_LOCK:
+                RUNNING_JOBS.pop(domain, None)
+            schedule_jobs()
+
+    thread = threading.Thread(target=runner, name=f"pipeline-{domain}", daemon=True)
+    with JOB_LOCK:
+        job["thread"] = thread
+        job["started"] = datetime.now(timezone.utc).isoformat()
+    thread.start()
+    job_log_append(domain, "Job dispatched to worker.", "scheduler")
+
+
+def schedule_jobs() -> None:
+    to_start: List[Dict[str, Any]] = []
+    with JOB_LOCK:
+        while JOB_QUEUE and count_active_jobs_locked() < MAX_RUNNING_JOBS:
+            domain = JOB_QUEUE.popleft()
+            job = RUNNING_JOBS.get(domain)
+            if not job or job.get("thread"):
+                continue
+            job["status"] = "dispatching"
+            job["message"] = "Preparing to start."
+            to_start.append(job)
+    for job in to_start:
+        _start_job_thread(job)
 
 
 # ================== WEB COMMAND CENTER ==================
 
-RUNNING_JOBS: Dict[str, Dict[str, Any]] = {}
-JOB_LOCK = threading.Lock()
+
+def make_step_entry(status: str = "pending", message: str = "", progress: int = 0) -> Dict[str, Any]:
+    return {
+        "status": status,
+        "message": message,
+        "progress": progress,
+    }
+
+
+def init_job_steps(skip_nikto: bool) -> Dict[str, Dict[str, Any]]:
+    steps = {step: make_step_entry() for step in PIPELINE_STEPS}
+    if skip_nikto:
+        steps["nikto"] = make_step_entry(status="skipped", message="Nikto skipped", progress=0)
+    return steps
+
+
+def recalc_job_progress(job: Dict[str, Any]) -> None:
+    steps = job.get("steps", {})
+    active = [entry for entry in steps.values() if entry.get("status") not in {"skipped"}]
+    if not active:
+        job["progress"] = 0
+        return
+    total = len(active)
+    total_progress = sum(STEP_PROGRESS.get(entry.get("status"), 0) for entry in active)
+    job["progress"] = min(100, max(0, int(total_progress / total)))
+
+
+def job_set_status(domain: str, status: str, message: Optional[str] = None) -> None:
+    if not domain:
+        return
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with JOB_LOCK:
+        job = RUNNING_JOBS.get(domain)
+        if not job:
+            return
+        job["status"] = status
+        if message is not None:
+            job["message"] = message
+        job["last_update"] = timestamp
+        recalc_job_progress(job)
+    if message:
+        job_log_append(domain, message, source=f"{status.upper()}")
+
+
+def job_step_update(domain: Optional[str], step: str, *, status: Optional[str] = None,
+                    message: Optional[str] = None, progress: Optional[int] = None) -> None:
+    if not domain:
+        return
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with JOB_LOCK:
+        job = RUNNING_JOBS.get(domain)
+        if not job:
+            return
+        step_entry = job.setdefault("steps", {}).setdefault(step, make_step_entry())
+        if status is not None:
+            step_entry["status"] = status
+        if message is not None:
+            step_entry["message"] = message
+        if progress is not None:
+            step_entry["progress"] = max(0, min(100, progress))
+        job["last_update"] = timestamp
+        recalc_job_progress(job)
+    if message:
+        job_log_append(domain, f"[{step}] {message}", source=step or "step")
+
+
+def job_record_has_errors(job: Dict[str, Any]) -> bool:
+    return any(entry.get("status") == "error" for entry in job.get("steps", {}).values())
+
+
+def append_domain_history(domain: str, entry: Dict[str, Any]) -> None:
+    if not domain or not entry:
+        return
+    try:
+        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        history_file = HISTORY_DIR / f"{domain}.jsonl"
+        with history_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as exc:
+        log(f"Failed to write history for {domain}: {exc}")
 
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -945,120 +1764,411 @@ INDEX_HTML = """<!DOCTYPE html>
 <title>Recon Command Center</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-body { font-family: Arial, sans-serif; background:#0b1120; color:#e2e8f0; margin:0; padding:20px; }
-h1, h2, h3, h4 { margin:0; }
-a { color:#93c5fd; }
+:root {
+  --bg: #020617;
+  --panel: #111827;
+  --panel-alt: #0f172a;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --accent: #2563eb;
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--text); font-family:'Inter','Segoe UI',system-ui,-apple-system,BlinkMacSystemFont,sans-serif; }
+a { color:#93c5fd; text-decoration:none; }
 code { background:#1e293b; padding:2px 4px; border-radius:4px; font-size:12px; }
-.muted { color:#94a3b8; font-size:14px; }
-.layout { max-width:1200px; margin:0 auto; }
-.panel { background:#111827; padding:20px; border-radius:12px; margin-bottom:20px; box-shadow:0 10px 25px rgba(0,0,0,0.3); }
-.panel h2 { color:#fbbf24; margin-bottom:12px; }
-label { display:block; font-weight:bold; margin-bottom:8px; }
-input[type="text"], input[type="number"] { width:100%; padding:10px; border-radius:8px; border:1px solid #1f2937; background:#0f172a; color:#f8fafc; }
-.checkbox { display:flex; align-items:center; gap:8px; font-weight:600; margin-top:12px; }
-.checkbox input { width:auto; }
-button { background:#2563eb; border:none; padding:10px 18px; border-radius:8px; color:white; font-size:15px; cursor:pointer; }
+.muted { color:var(--muted); font-size:13px; }
+.app-shell { display:flex; min-height:100vh; }
+.sidebar { width:250px; background:#050c1c; padding:24px 18px; display:flex; flex-direction:column; gap:24px; border-right:1px solid #0f172a; position:sticky; top:0; height:100vh; }
+.brand { display:flex; align-items:center; gap:12px; }
+.brand-icon { width:42px; height:42px; border-radius:14px; background:#1d4ed8; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:18px; }
+.brand-title { font-size:18px; font-weight:600; line-height:1.2; }
+.nav { display:flex; flex-direction:column; gap:8px; }
+.nav-link { padding:10px 14px; border-radius:10px; color:var(--text); border:1px solid transparent; transition:all .2s ease; font-weight:500; display:block; }
+.nav-link:hover, .nav-link.active { background:#0f172a; border-color:#1e293b; }
+.sidebar-footer { margin-top:auto; font-size:12px; color:var(--muted); }
+.sidebar-footer code { background:#0f172a; padding:2px 6px; border-radius:6px; }
+.main-content { flex:1; padding:32px; }
+.module { display:none; background:var(--panel); border-radius:18px; border:1px solid #1e293b; padding:24px; margin-bottom:28px; box-shadow:0 18px 35px rgba(0,0,0,0.3); }
+.module.active { display:block; }
+.module-header { display:flex; justify-content:space-between; align-items:center; gap:18px; margin-bottom:18px; }
+.module-header h2 { margin:0; font-size:24px; color:#fbbf24; }
+.stats-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; }
+.stat-card { background:var(--panel-alt); border-radius:12px; padding:16px; border:1px solid #1e293b; }
+.stat-card .label { font-size:12px; text-transform:uppercase; letter-spacing:0.08em; color:var(--muted); margin-bottom:6px; }
+.stat-card .value { font-size:26px; font-weight:600; }
+.grid-two { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:18px; }
+.card { background:var(--panel-alt); border-radius:12px; border:1px solid #1f2937; padding:18px; }
+label { display:block; font-weight:600; margin-top:12px; }
+input[type="text"], input[type="number"] { width:100%; padding:10px; border-radius:8px; border:1px solid #1f2937; background:#0b152c; color:var(--text); }
+input[type="number"]::-webkit-inner-spin-button { opacity:0.4; }
+.checkbox { display:flex; align-items:center; gap:8px; margin-top:12px; font-weight:600; }
+button { margin-top:16px; background:var(--accent); border:none; color:white; border-radius:10px; padding:10px 18px; font-size:15px; font-weight:600; cursor:pointer; transition:background .2s ease; }
 button:hover { background:#1d4ed8; }
 .status { margin-top:10px; min-height:20px; }
 .status.error { color:#f87171; }
 .status.success { color:#4ade80; }
-.success { color:#4ade80; }
-.error { color:#f87171; }
-.targets { display:flex; flex-direction:column; gap:18px; }
-.target-card { border:1px solid #1e293b; border-radius:12px; padding:16px; background:#0f172a; }
-.target-header { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:12px; }
-.badge { background:#1e293b; padding:4px 10px; border-radius:999px; font-size:12px; margin-right:6px; display:inline-block; }
-table { width:100%; border-collapse:collapse; margin-top:12px; }
-th, td { border:1px solid #1f2937; padding:6px 8px; font-size:12px; }
-th { background:#1e293b; text-align:left; }
-tr:nth-child(even) { background:#0b152c; }
-.tag { display:inline-block; padding:2px 6px; border-radius:8px; margin:2px; font-size:11px; }
-.sev-low { background:#0f766e; }
-.sev-medium { background:#eab308; }
-.sev-high { background:#f97316; }
-.sev-critical { background:#b91c1c; }
-.settings-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }
-.tool-list { list-style:none; padding-left:0; margin:8px 0 0 0; }
-.tool-list li { margin-bottom:4px; }
+.section-placeholder { padding:18px; border-radius:12px; background:#0b152c; border:1px dashed #1e293b; text-align:center; color:var(--muted); }
+.badge { background:#1e293b; padding:4px 8px; border-radius:999px; font-size:12px; margin-left:6px; }
+.job-card, .target-card, .queue-card { border-radius:12px; border:1px solid #1e293b; background:var(--panel-alt); margin-bottom:12px; padding:18px; }
+.target-card.highlight { box-shadow:0 0 0 2px #fbbf24; }
+.job-summary { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px; }
+.job-meta { display:flex; flex-wrap:wrap; gap:12px; font-size:13px; color:var(--muted); margin:12px 0; }
+.job-message { font-size:13px; margin-bottom:12px; color:#fcd34d; }
+.progress-bar { width:100%; height:8px; border-radius:999px; background:#1e293b; overflow:hidden; margin-top:8px; }
+.progress-inner { height:100%; border-radius:999px; background:#3b82f6; transition:width .3s ease; }
+.progress-inner.status-completed { background:#16a34a; }
+.progress-inner.status-error, .progress-inner.status-failed { background:#dc2626; }
+.status-pill { display:inline-flex; align-items:center; padding:3px 10px; border-radius:999px; font-size:12px; text-transform:capitalize; border:1px solid transparent; }
+.status-running { background:rgba(37,99,235,0.2); border-color:#2563eb; color:#bfdbfe; }
+.status-completed { background:rgba(22,163,74,0.2); border-color:#16a34a; color:#bbf7d0; }
+.status-error, .status-failed { background:rgba(239,68,68,0.2); border-color:#ef4444; color:#fecaca; }
+.status-skipped { background:rgba(148,163,184,0.2); border-color:#64748b; color:#e2e8f0; }
+.job-steps { display:flex; flex-direction:column; gap:10px; }
+.step-row { border:1px solid #1f2937; border-radius:10px; padding:10px 12px; background:#0b152c; }
+.step-header { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+.step-name { font-weight:600; text-transform:uppercase; font-size:12px; letter-spacing:0.08em; }
+.job-log { margin-top:16px; max-height:240px; overflow-y:auto; background:#050b18; border:1px solid #1f2937; border-radius:12px; padding:12px; font-family:'JetBrains Mono','Fira Code','SFMono-Regular',monospace; font-size:12px; }
+.log-entry { margin-bottom:8px; }
+.log-meta { color:var(--muted); font-size:11px; margin-bottom:2px; }
+.log-text { margin:0; white-space:pre-wrap; word-break:break-word; }
+.queue-card { display:flex; flex-direction:column; gap:8px; }
+.queue-row { display:flex; justify-content:space-between; align-items:center; }
+.queue-meta { display:flex; flex-wrap:wrap; gap:12px; font-size:13px; color:var(--muted); }
+.worker-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; }
+.worker-card { background:var(--panel-alt); border-radius:14px; padding:16px; border:1px solid #1f2937; box-shadow:0 10px 20px rgba(0,0,0,0.2); }
+.worker-card h3 { margin:0 0 8px 0; font-size:15px; text-transform:uppercase; letter-spacing:0.08em; color:#93c5fd; }
+.worker-card .metric { font-size:32px; font-weight:600; }
+.worker-card .muted { margin-top:4px; }
+.worker-progress { margin-top:10px; }
+.btn { display:inline-block; padding:8px 16px; border-radius:8px; background:var(--accent); color:white; font-weight:600; border:none; cursor:pointer; transition:background .2s ease; text-decoration:none; }
+.btn.secondary { background:#1f2937; }
+.btn:hover { background:#1d4ed8; }
+.export-actions { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:16px; }
+.targets-table { width:100%; border-collapse:collapse; font-size:13px; }
+.targets-table th, .targets-table td { border:1px solid #1f2937; padding:6px 8px; text-align:left; }
+.targets-table th { background:#162132; }
+.reports-table { width:100%; border-collapse:collapse; margin-top:10px; font-size:13px; }
+.reports-table th, .reports-table td { border:1px solid #1f2937; padding:6px 8px; text-align:left; }
+.reports-table th { background:#162132; }
+.link-btn { background:none; border:none; color:#93c5fd; cursor:pointer; text-decoration:underline; padding:0; font:inherit; }
+.modal-overlay { position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(2,6,23,0.85); display:none; align-items:center; justify-content:center; z-index:1000; }
+.modal-overlay.show { display:flex; }
+.modal { width:90%; max-width:900px; max-height:90vh; overflow-y:auto; background:#0f172a; border:1px solid #1e293b; border-radius:16px; padding:24px; box-shadow:0 25px 60px rgba(0,0,0,0.5); }
+.modal h3 { margin-top:0; color:#fbbf24; }
+.modal-close { position:absolute; top:16px; right:24px; background:none; border:none; color:#f87171; font-size:24px; cursor:pointer; }
+.detail-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:16px; margin-bottom:16px; }
+.timeline { max-height:250px; overflow:auto; border:1px solid #1e293b; border-radius:12px; padding:12px; background:#050b18; }
+.timeline-entry { margin-bottom:10px; }
+.timeline-entry .meta { color:var(--muted); font-size:11px; margin-bottom:3px; }
+.table-wrapper { overflow-x:auto; margin-top:10px; }
+.settings-layout { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:18px; margin-top:18px; }
+.paths-grid { display:grid; grid-template-columns:1fr; gap:12px; }
+.paths-grid div { padding:10px 12px; background:#0b152c; border-radius:10px; border:1px solid #1f2937; font-size:13px; }
+.tool-list { list-style:none; padding-left:0; margin:0; }
+.tool-list li { display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1f2937; padding:6px 0; color:var(--text); font-size:13px; }
+.tool-list li:last-child { border-bottom:none; }
+.tool-status { font-size:12px; display:flex; gap:6px; align-items:center; }
+.tips { list-style:disc; margin:12px 0 0 18px; color:var(--muted); font-size:13px; }
+@media (max-width: 900px) {
+  .app-shell { flex-direction:column; }
+  .sidebar { width:100%; height:auto; position:relative; }
+}
 </style>
 </head>
 <body>
-<div class="layout">
-  <header class="panel">
-    <h1>Recon Command Center</h1>
-    <p id="last-updated" class="muted">Last updated: never</p>
-  </header>
-
-  <section class="panel">
-    <h2>Launch New Recon</h2>
-    <form id="launch-form">
-      <label>Domain / TLD
-        <input id="launch-domain" type="text" name="domain" placeholder="example.com" required />
-      </label>
-      <label>Wordlist path (optional)
-        <input id="launch-wordlist" type="text" name="wordlist" placeholder="./w.txt" />
-      </label>
-      <label>Dashboard interval seconds
-        <input id="launch-interval" type="number" name="interval" min="5" />
-      </label>
-      <label class="checkbox">
-        <input id="launch-skip-nikto" type="checkbox" name="skip_nikto" />
-        Skip Nikto for this run
-      </label>
-      <button type="submit">Start Recon</button>
-    </form>
-    <div class="status" id="launch-status"></div>
-  </section>
-
-  <section class="panel">
-    <h2>Settings</h2>
-    <div id="settings-summary" class="muted">Loading settings…</div>
-    <form id="settings-form">
-      <div class="settings-grid">
-        <label>Default wordlist
-          <input id="settings-wordlist" type="text" name="default_wordlist" placeholder="./w.txt" />
-        </label>
-        <label>Default interval (seconds)
-          <input id="settings-interval" type="number" name="default_interval" min="5" />
-        </label>
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-icon">🛰️</div>
+      <div>
+        <div class="brand-title">Recon Command Center</div>
+        <div class="muted">Your bounty HQ</div>
       </div>
-      <label class="checkbox">
-        <input id="settings-skip-nikto" type="checkbox" name="skip_nikto_by_default" />
-        Skip Nikto by default
-      </label>
-      <button type="submit">Save Settings</button>
-    </form>
-    <div class="status" id="settings-status"></div>
-  </section>
-
-  <section class="panel">
-    <h2>Active Jobs</h2>
-    <div id="active-jobs" class="muted">No active jobs.</div>
-  </section>
-
-  <section class="panel">
-    <h2>Targets</h2>
-    <div id="targets" class="targets">
-      <p class="muted">No reconnaissance data yet.</p>
     </div>
-  </section>
-</div>
+    <nav class="nav">
+      <a class="nav-link" data-view="overview" href="#overview">Overview</a>
+      <a class="nav-link" data-view="jobs" href="#jobs">Active Jobs</a>
+      <a class="nav-link" data-view="workers" href="#workers">Workers</a>
+      <a class="nav-link" data-view="queue" href="#queue">Queue</a>
+      <a class="nav-link" data-view="reports" href="#reports">Reports</a>
+      <a class="nav-link" data-view="targets" href="#targets">Targets</a>
+      <a class="nav-link" data-view="settings" href="#settings">Settings</a>
+    </nav>
+    <div class="sidebar-footer">
+      Outputs live in <code>recon_data/</code>. Keep this UI open while jobs run.
+    </div>
+  </aside>
+  <main class="main-content">
+    <section class="module" data-view="overview">
+      <div class="module-header">
+        <h2>Overview</h2>
+        <p class="muted" id="last-updated">Last updated: never</p>
+      </div>
+      <div class="module-body">
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="label">Active Jobs</div>
+            <div class="value" id="stat-active">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Queued Jobs</div>
+            <div class="value" id="stat-queued">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Tracked Targets</div>
+            <div class="value" id="stat-targets">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Known Subdomains</div>
+            <div class="value" id="stat-subdomains">0</div>
+          </div>
+        </div>
+        <div class="grid-two">
+          <div class="card">
+            <h3>Launch Recon</h3>
+            <form id="launch-form">
+              <label>Domain / TLD
+                <input id="launch-domain" type="text" name="domain" placeholder="example.com" required />
+              </label>
+              <label>Wordlist path (optional)
+                <input id="launch-wordlist" type="text" name="wordlist" placeholder="./w.txt" />
+              </label>
+              <label>Dashboard interval seconds
+                <input id="launch-interval" type="number" name="interval" min="5" />
+              </label>
+              <label class="checkbox">
+                <input id="launch-skip-nikto" type="checkbox" name="skip_nikto" />
+                Skip Nikto for this run
+              </label>
+              <button type="submit">Start Recon</button>
+            </form>
+            <div class="status" id="launch-status"></div>
+          </div>
+          <div class="card">
+            <h3>Quick Tips</h3>
+            <ul class="tips">
+              <li>Jobs update this view live; queue multiple targets safely.</li>
+              <li>Adjust concurrency limits in Settings to control system load.</li>
+              <li>Targets reuse the shared <code>state.json</code>, so reruns pick up where they left off.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
 
+    <section class="module" data-view="jobs">
+      <div class="module-header"><h2>Active Jobs</h2></div>
+      <div class="module-body" id="jobs-list">
+        <div class="section-placeholder">No active jobs.</div>
+      </div>
+    </section>
+
+    <section class="module" data-view="workers">
+      <div class="module-header"><h2>Workers</h2></div>
+      <div class="module-body" id="workers-body">
+        <div class="section-placeholder">Loading worker data…</div>
+      </div>
+    </section>
+
+    <section class="module" data-view="queue">
+      <div class="module-header"><h2>Job Queue</h2></div>
+      <div class="module-body">
+        <p class="muted">Jobs wait here when all worker slots are busy. They start automatically.</p>
+        <div id="queue-list" class="queue-list section-placeholder">Queue empty.</div>
+      </div>
+    </section>
+
+    <section class="module" data-view="reports">
+      <div class="module-header"><h2>Reports & Export</h2></div>
+      <div class="module-body" id="reports-body">
+        <div class="section-placeholder">No data yet.</div>
+      </div>
+    </section>
+
+    <section class="module" data-view="targets">
+      <div class="module-header"><h2>Targets</h2></div>
+      <div class="module-body" id="targets-list">
+        <div class="section-placeholder">No reconnaissance data yet.</div>
+      </div>
+    </section>
+
+    <section class="module" data-view="settings">
+      <div class="module-header"><h2>Settings & Tooling</h2></div>
+      <div class="module-body">
+        <div class="card" id="settings-summary">Loading settings…</div>
+        <div class="settings-layout">
+          <div class="card">
+            <h3>Defaults & Limits</h3>
+            <form id="settings-form">
+              <label>Default wordlist
+                <input id="settings-wordlist" type="text" name="default_wordlist" placeholder="./w.txt" />
+              </label>
+              <label>Default interval (seconds)
+                <input id="settings-interval" type="number" name="default_interval" min="5" />
+              </label>
+              <label class="checkbox">
+                <input id="settings-skip-nikto" type="checkbox" name="skip_nikto_by_default" />
+                Skip Nikto by default
+              </label>
+              <label class="checkbox">
+                <input id="settings-enable-amass" type="checkbox" name="enable_amass" />
+                Enable Amass
+              </label>
+              <label>Amass timeout (seconds)
+                <input id="settings-amass-timeout" type="number" name="amass_timeout" min="0" />
+              </label>
+              <label class="checkbox">
+                <input id="settings-enable-subfinder" type="checkbox" name="enable_subfinder" />
+                Enable Subfinder
+              </label>
+              <label class="checkbox">
+                <input id="settings-enable-assetfinder" type="checkbox" name="enable_assetfinder" />
+                Enable Assetfinder
+              </label>
+              <label class="checkbox">
+                <input id="settings-enable-findomain" type="checkbox" name="enable_findomain" />
+                Enable Findomain
+              </label>
+              <label class="checkbox">
+                <input id="settings-enable-sublist3r" type="checkbox" name="enable_sublist3r" />
+                Enable Sublist3r
+              </label>
+              <label>Subfinder threads
+                <input id="settings-subfinder-threads" type="number" name="subfinder_threads" min="1" />
+              </label>
+              <label>Assetfinder threads
+                <input id="settings-assetfinder-threads" type="number" name="assetfinder_threads" min="1" />
+              </label>
+              <label>Findomain threads
+                <input id="settings-findomain-threads" type="number" name="findomain_threads" min="1" />
+              </label>
+              <label>Max concurrent jobs
+                <input id="settings-max-jobs" type="number" name="max_running_jobs" min="1" />
+              </label>
+              <label>ffuf parallel slots
+                <input id="settings-ffuf" type="number" name="max_parallel_ffuf" min="1" />
+              </label>
+              <label>nuclei parallel slots
+                <input id="settings-nuclei" type="number" name="max_parallel_nuclei" min="1" />
+              </label>
+              <label>Nikto parallel slots
+                <input id="settings-nikto" type="number" name="max_parallel_nikto" min="1" />
+              </label>
+              <button type="submit">Save Settings</button>
+            </form>
+            <div class="status" id="settings-status"></div>
+          </div>
+          <div class="card">
+            <h3>Toolchain</h3>
+            <ul id="tools-list" class="tool-list">
+              <li class="muted">Detecting tool paths…</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<div class="modal-overlay" id="detail-overlay">
+  <div class="modal">
+    <button class="modal-close" id="detail-close">&times;</button>
+    <div id="detail-content"></div>
+  </div>
+</div>
 <script>
+const navLinks = document.querySelectorAll('.nav-link');
+const viewSections = document.querySelectorAll('.module');
+function setView(target) {
+  const next = target || 'overview';
+  viewSections.forEach(section => section.classList.toggle('active', section.dataset.view === next));
+  navLinks.forEach(link => link.classList.toggle('active', link.dataset.view === next));
+  history.replaceState(null, '', `#${next}`);
+}
+navLinks.forEach(link => {
+  link.addEventListener('click', (event) => {
+    event.preventDefault();
+    setView(link.dataset.view);
+  });
+});
+const initialView = location.hash ? location.hash.substring(1) : 'overview';
+setView(initialView || 'overview');
+
 const POLL_INTERVAL = 8000;
 const launchForm = document.getElementById('launch-form');
 const launchWordlist = document.getElementById('launch-wordlist');
 const launchInterval = document.getElementById('launch-interval');
 const launchSkipNikto = document.getElementById('launch-skip-nikto');
 const launchStatus = document.getElementById('launch-status');
+const jobsList = document.getElementById('jobs-list');
+const queueList = document.getElementById('queue-list');
+const targetsList = document.getElementById('targets-list');
+const toolsList = document.getElementById('tools-list');
+const workersBody = document.getElementById('workers-body');
+const reportsBody = document.getElementById('reports-body');
+const detailOverlay = document.getElementById('detail-overlay');
+const detailContent = document.getElementById('detail-content');
+const detailClose = document.getElementById('detail-close');
+let latestTargetsData = {};
+const historyCache = {};
 const settingsForm = document.getElementById('settings-form');
 const settingsWordlist = document.getElementById('settings-wordlist');
 const settingsInterval = document.getElementById('settings-interval');
 const settingsSkipNikto = document.getElementById('settings-skip-nikto');
+const settingsEnableAmass = document.getElementById('settings-enable-amass');
+const settingsAmassTimeout = document.getElementById('settings-amass-timeout');
+const settingsEnableSubfinder = document.getElementById('settings-enable-subfinder');
+const settingsEnableAssetfinder = document.getElementById('settings-enable-assetfinder');
+const settingsEnableFindomain = document.getElementById('settings-enable-findomain');
+const settingsEnableSublist3r = document.getElementById('settings-enable-sublist3r');
+const settingsSubfinderThreads = document.getElementById('settings-subfinder-threads');
+const settingsAssetfinderThreads = document.getElementById('settings-assetfinder-threads');
+const settingsFindomainThreads = document.getElementById('settings-findomain-threads');
+const settingsMaxJobs = document.getElementById('settings-max-jobs');
+const settingsFFUF = document.getElementById('settings-ffuf');
+const settingsNuclei = document.getElementById('settings-nuclei');
+const settingsNikto = document.getElementById('settings-nikto');
 const settingsStatus = document.getElementById('settings-status');
 const settingsSummary = document.getElementById('settings-summary');
+const statActive = document.getElementById('stat-active');
+const statQueued = document.getElementById('stat-queued');
+const statTargets = document.getElementById('stat-targets');
+const statSubs = document.getElementById('stat-subdomains');
 let launchFormDirty = false;
 let settingsFormDirty = false;
+
+const STATUS_LABELS = {
+  queued: 'Queued',
+  running: 'Running',
+  completed: 'Completed',
+  completed_with_errors: 'Completed w/ warnings',
+  failed: 'Failed',
+  error: 'Error',
+  skipped: 'Skipped',
+  pending: 'Pending'
+};
+
+function statusLabel(value) {
+  if (!value) return 'Unknown';
+  return STATUS_LABELS[value] || value.replace(/_/g, ' ');
+}
+
+function statusClass(value) {
+  switch (value) {
+    case 'completed':
+      return 'status-completed';
+    case 'completed_with_errors':
+    case 'error':
+    case 'failed':
+      return 'status-error';
+    case 'running':
+    case 'queued':
+      return 'status-running';
+    case 'skipped':
+    case 'pending':
+    default:
+      return 'status-skipped';
+  }
+}
 
 function escapeHtml(value) {
   if (value === undefined || value === null) return '';
@@ -1070,129 +2180,405 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
-function renderJobs(jobs) {
-  const container = document.getElementById('active-jobs');
-  if (!jobs || jobs.length === 0) {
-    container.innerHTML = '<p class="muted">No active jobs.</p>';
-    return;
-  }
-  const items = jobs.map(job => {
-    const nikto = job.skip_nikto ? ' (Nikto skipped)' : '';
-    const wl = job.wordlist ? ` wordlist: ${escapeHtml(job.wordlist)}` : '';
-    return `<li><strong>${escapeHtml(job.domain)}</strong> since ${escapeHtml(job.started || 'now')}${wl}${nikto}</li>`;
-  });
-  container.innerHTML = `<ul>${items.join('')}</ul>`;
+function fmtTime(value) {
+  if (!value) return 'N/A';
+  const d = new Date(value);
+  if (isNaN(d.getTime())) return escapeHtml(value);
+  return d.toLocaleString();
 }
 
-function renderTargets(targets) {
-  const container = document.getElementById('targets');
-  if (!targets || Object.keys(targets).length === 0) {
-    container.innerHTML = '<p class="muted">No reconnaissance data yet.</p>';
+function renderProgress(value, status) {
+  const width = Math.max(0, Math.min(100, value || 0));
+  return `<div class="progress-bar"><div class="progress-inner ${statusClass(status)}" style="width:${width}%"></div></div>`;
+}
+
+function renderLogEntries(logs) {
+  const safeLogs = Array.isArray(logs) ? logs : [];
+  if (!safeLogs.length) {
+    return '<p class="muted">No output yet.</p>';
+  }
+  return safeLogs.slice(-200).map(entry => {
+    return `
+      <div class="log-entry">
+        <div class="log-meta">${fmtTime(entry.ts)} — ${escapeHtml(entry.source || 'app')}</div>
+        <pre class="log-text">${escapeHtml(entry.text || '')}</pre>
+      </div>
+    `;
+  }).join('');
+}
+
+function renderJobStep(name, info = {}) {
+  const status = info.status || 'pending';
+  const message = info.message || '';
+  const pct = info.progress !== undefined ? info.progress : (status === 'completed' ? 100 : 0);
+  return `
+    <div class="step-row">
+      <div class="step-header">
+        <span class="step-name">${escapeHtml(name.toUpperCase())}</span>
+        <span class="status-pill ${statusClass(status)}">${statusLabel(status)}</span>
+      </div>
+      <p class="muted">${escapeHtml(message)}</p>
+      ${renderProgress(pct, status)}
+    </div>
+  `;
+}
+
+function renderJobs(jobs) {
+  const all = Array.isArray(jobs) ? jobs : [];
+  const running = all.filter(job => job.status !== 'queued');
+  statActive.textContent = running.length;
+  if (!running.length) {
+    jobsList.innerHTML = '<div class="section-placeholder">No active jobs.</div>';
     return;
   }
-  const cards = [];
-  const flagIcon = (label, done) => `<span class="badge">${label}: ${done ? '✅' : '⏳'}</span>`;
-
-  Object.keys(targets).sort().forEach(domain => {
-    const info = targets[domain] || {};
-    const subs = info.subdomains || {};
-    const flags = info.flags || {};
-    const header = `
-      <div class="target-header">
-        <h3>${escapeHtml(domain)}</h3>
-        <div>
-          ${flagIcon('Subdomains', Object.keys(subs).length)}
-          ${flagIcon('Amass', flags.amass_done)}
-          ${flagIcon('ffuf', flags.ffuf_done)}
-          ${flagIcon('httpx', flags.httpx_done)}
-          ${flagIcon('nuclei', flags.nuclei_done)}
-          ${flagIcon('nikto', flags.nikto_done)}
+  const cards = running.map(job => {
+    const progress = Math.max(0, Math.min(100, job.progress || 0));
+    const steps = job.steps || {};
+    const stepsHtml = Object.keys(steps).map(step => renderJobStep(step, steps[step])).join('');
+    const logsHtml = renderLogEntries(job.logs || []);
+    return `
+      <div class="job-card">
+        <div class="job-summary">
+          <div>
+            <div>${escapeHtml(job.domain || '')}</div>
+            <div class="muted">Started ${fmtTime(job.started)}</div>
+          </div>
+          <div class="job-summary-meta">
+            <span class="status-pill ${statusClass(job.status)}">${statusLabel(job.status)}</span>
+            <span class="badge">${progress}%</span>
+          </div>
+        </div>
+        ${renderProgress(progress, job.status)}
+        <div class="job-meta">
+          <span><strong>Wordlist:</strong> ${escapeHtml(job.wordlist || 'default')}</span>
+          <span><strong>Interval:</strong> ${escapeHtml(job.interval || 0)}s</span>
+          <span><strong>Nikto:</strong> ${job.skip_nikto ? 'Skipped' : 'Enabled'}</span>
+        </div>
+        <div class="job-message">${escapeHtml(job.message || '')}</div>
+        <div class="job-steps">
+          ${stepsHtml || '<p class="muted">Awaiting step updates…</p>'}
+        </div>
+        <div class="job-log">
+          ${logsHtml}
         </div>
       </div>
     `;
+  });
+  jobsList.innerHTML = cards.join('');
+}
 
-    const rows = Object.keys(subs).sort().map((sub, idx) => {
+function renderQueue(queue) {
+  const items = Array.isArray(queue) ? queue : [];
+  statQueued.textContent = items.length;
+  if (!items.length) {
+    queueList.innerHTML = '<div class="section-placeholder">Queue empty.</div>';
+    return;
+  }
+  const cards = items.map((job) => {
+    return `
+      <div class="queue-card">
+        <div class="queue-row">
+          <strong>${escapeHtml(job.domain || '')}</strong>
+          <span class="badge">#${escapeHtml(job.position || 0)}</span>
+        </div>
+        <p class="muted">Queued ${fmtTime(job.queued_at)}</p>
+        <div class="queue-meta">
+          <span>Wordlist: ${escapeHtml(job.wordlist || 'default')}</span>
+          <span>Interval: ${escapeHtml(job.interval || 0)}s</span>
+          <span>Nikto: ${job.skip_nikto ? 'Skipped' : 'Enabled'}</span>
+        </div>
+      </div>
+    `;
+  }).join('');
+  queueList.innerHTML = cards;
+}
+
+function renderTargets(targets) {
+  latestTargetsData = targets || {};
+  const entries = Object.entries(targets || {});
+  statTargets.textContent = entries.length;
+  if (!entries.length) {
+    targetsList.innerHTML = '<div class="section-placeholder">No reconnaissance data yet.</div>';
+    statSubs.textContent = 0;
+    return;
+  }
+  entries.sort((a, b) => a[0].localeCompare(b[0]));
+  let subCount = 0;
+  const cards = entries.map(([domain, info]) => {
+    const subs = (info && info.subdomains) || {};
+    const flags = (info && info.flags) || {};
+    const keys = Object.keys(subs).sort();
+    subCount += keys.length;
+    const rows = keys.map((sub, idx) => {
       const entry = subs[sub] || {};
-      const httpx = entry.httpx || {};
-      const nuclei = Array.isArray(entry.nuclei) ? entry.nuclei : [];
-      const nikto = Array.isArray(entry.nikto) ? entry.nikto : [];
-      const httpSummary = httpx.status_code ? `${httpx.status_code} ${escapeHtml(httpx.title || '')} [${escapeHtml(httpx.webserver || '')}]` : '';
-
-      const nucleiTags = nuclei.map(n => {
-        const sev = (n.severity || 'info').toLowerCase();
-        const cls = sev === 'critical' ? 'sev-critical' :
-                    sev === 'high' ? 'sev-high' :
-                    sev === 'medium' ? 'sev-medium' : 'sev-low';
-        return `<span class="tag ${cls}">${escapeHtml(sev)}: ${escapeHtml(n.template_id || '')}</span>`;
-      }).join('');
-
-      const niktoText = nikto.length ? `${nikto.length} findings` : '';
       const sources = Array.isArray(entry.sources) ? entry.sources.join(', ') : '';
-
+      const httpx = entry.httpx || {};
+      const httpSummary = httpx.status_code ? `${httpx.status_code} ${escapeHtml(httpx.title || '')} [${escapeHtml(httpx.webserver || '')}]` : '';
+      const nuclei = Array.isArray(entry.nuclei) ? entry.nuclei : [];
+      const nucleiBits = nuclei.map(n => `<span class="badge">${escapeHtml((n.severity || '').toUpperCase())}: ${escapeHtml(n.template_id || '')}</span>`).join(' ');
+      const nikto = Array.isArray(entry.nikto) ? entry.nikto : [];
+      const niktoText = nikto.length ? `${nikto.length} findings` : '';
       return `
         <tr>
           <td>${idx + 1}</td>
-          <td>${escapeHtml(sub)}</td>
+          <td><button class="link-btn sub-link" data-domain="${escapeHtml(domain)}" data-sub="${escapeHtml(sub)}">${escapeHtml(sub)}</button></td>
           <td>${escapeHtml(sources)}</td>
           <td>${escapeHtml(httpSummary)}</td>
-          <td>${nucleiTags}</td>
+          <td>${nucleiBits}</td>
           <td>${escapeHtml(niktoText)}</td>
         </tr>
       `;
     }).join('');
-
+    const badges = `
+      <span class="badge">Subdomains: ${keys.length}</span>
+      <span class="badge">Amass: ${flags.amass_done ? '✅' : '⏳'}</span>
+      <span class="badge">Subfinder: ${flags.subfinder_done ? '✅' : '⏳'}</span>
+      <span class="badge">Assetfinder: ${flags.assetfinder_done ? '✅' : '⏳'}</span>
+      <span class="badge">Findomain: ${flags.findomain_done ? '✅' : '⏳'}</span>
+      <span class="badge">Sublist3r: ${flags.sublist3r_done ? '✅' : '⏳'}</span>
+      <span class="badge">ffuf: ${flags.ffuf_done ? '✅' : '⏳'}</span>
+      <span class="badge">httpx: ${flags.httpx_done ? '✅' : '⏳'}</span>
+      <span class="badge">nuclei: ${flags.nuclei_done ? '✅' : '⏳'}</span>
+      <span class="badge">nikto: ${flags.nikto_done ? '✅' : '⏳'}</span>
+    `;
     const table = rows ? `
-      <table>
+      <div class="table-wrapper">
+        <table class="targets-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Subdomain</th>
+              <th>Sources</th>
+              <th>HTTP</th>
+              <th>Nuclei</th>
+              <th>Nikto</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    ` : '<p class="muted">No subdomains collected yet.</p>';
+    return `
+      <div class="target-card" data-domain="${escapeHtml(domain)}">
+        <div class="job-summary">
+          <div>${escapeHtml(domain)}</div>
+          <div>${badges}</div>
+        </div>
+        ${table}
+      </div>
+    `;
+  });
+  statSubs.textContent = subCount;
+  targetsList.innerHTML = cards.join('');
+}
+
+function renderWorkers(workers) {
+  if (!workers || !workers.job_slots) {
+    workersBody.innerHTML = '<div class="section-placeholder">No worker data.</div>';
+    return;
+  }
+  const job = workers.job_slots || {};
+  const jobPct = job.limit ? Math.min(100, Math.round((job.active || 0) / job.limit * 100)) : 0;
+  const jobCard = `
+    <div class="worker-card">
+      <h3>Job Slots</h3>
+      <div class="metric">${job.active || 0}/${job.limit || 1}</div>
+      <div class="muted">${job.queue || 0} queued</div>
+      <div class="worker-progress">${renderProgress(jobPct, (job.active || 0) >= (job.limit || 1) ? 'running' : 'completed')}</div>
+    </div>
+  `;
+  const tools = workers.tools || {};
+  const toolCards = Object.keys(tools).sort().map(name => {
+    const info = tools[name] || {};
+    const limit = info.limit || 1;
+    const active = info.active || 0;
+    const pct = limit ? Math.min(100, Math.round(active / limit * 100)) : 0;
+    return `
+      <div class="worker-card">
+        <h3>${escapeHtml(name)}</h3>
+        <div class="metric">${active}/${limit}</div>
+        <div class="muted">slots in use</div>
+        <div class="worker-progress">${renderProgress(pct, active >= limit ? 'running' : 'completed')}</div>
+      </div>
+    `;
+  }).join('') || '<div class="section-placeholder">No tool data.</div>';
+  workersBody.innerHTML = `<div class="worker-grid">${jobCard}${toolCards}</div>`;
+}
+
+function closeDetailModal() {
+  detailOverlay.classList.remove('show');
+  detailContent.innerHTML = '';
+}
+
+async function openSubdomainDetail(domain, sub) {
+  if (!latestTargetsData[domain] || !latestTargetsData[domain].subdomains[sub]) return;
+  const info = latestTargetsData[domain].subdomains[sub];
+  const history = await fetchHistory(domain);
+  detailContent.innerHTML = buildDetailHtml(domain, sub, info, history);
+  detailOverlay.classList.add('show');
+}
+
+async function fetchHistory(domain) {
+  if (historyCache[domain]) return historyCache[domain];
+  try {
+    const resp = await fetch(`/api/history?domain=${encodeURIComponent(domain)}`);
+    if (!resp.ok) throw new Error('Failed to fetch history');
+    const data = await resp.json();
+    historyCache[domain] = data.events || [];
+    return historyCache[domain];
+  } catch (err) {
+    return [];
+  }
+}
+
+function buildDetailHtml(domain, sub, info, history) {
+  const sources = info.sources || [];
+  const httpx = info.httpx || {};
+  const nuclei = info.nuclei || [];
+  const nikto = info.nikto || [];
+  const filteredHistory = history.filter(event => {
+    const text = (event.text || '').toLowerCase();
+    const src = (event.source || '').toLowerCase();
+    const needle = (sub || '').toLowerCase();
+    return needle && (text.includes(needle) || src.includes(needle));
+  });
+  return `
+    <h3>${escapeHtml(sub)} <span class="badge">${escapeHtml(domain)}</span></h3>
+    <div class="detail-grid">
+      <div>
+        <h4>Sources</h4>
+        <p>${sources.join(', ') || 'Unknown'}</p>
+      </div>
+      <div>
+        <h4>HTTP</h4>
+        <p>${httpx.status_code || '—'} ${escapeHtml(httpx.title || '')}</p>
+        <p>${escapeHtml(httpx.webserver || '')}</p>
+      </div>
+      <div>
+        <h4>Nuclei Findings</h4>
+        ${nuclei.length ? nuclei.map(n => `<div><strong>${escapeHtml(n.template_id || '')}</strong> (${escapeHtml((n.severity || '').toUpperCase())})<br>${escapeHtml(n.matched_at || '')}</div>`).join('') : '<p>None</p>'}
+      </div>
+      <div>
+        <h4>Nikto Findings</h4>
+        ${nikto.length ? nikto.map(n => `<div>${escapeHtml(n.msg || n.raw || '')}</div>`).join('') : '<p>None</p>'}
+      </div>
+    </div>
+    <h4>Timeline</h4>
+    <div class="timeline">
+      ${filteredHistory.length ? filteredHistory.map(evt => `
+        <div class="timeline-entry">
+          <div class="meta">${escapeHtml(evt.ts || '')} — ${escapeHtml(evt.source || '')}</div>
+          <div>${escapeHtml(evt.text || '')}</div>
+        </div>
+      `).join('') : '<p class="muted">No history for this subdomain yet.</p>'}
+    </div>
+  `;
+}
+
+function renderReports(targets) {
+  const entries = Object.entries(targets || {});
+  if (!entries.length) {
+    reportsBody.innerHTML = '<div class="section-placeholder">No reconnaissance data yet.</div>';
+    return;
+  }
+  const rows = entries.sort((a, b) => b[1]?.subdomains ? Object.keys(b[1].subdomains || {}).length - Object.keys(a[1].subdomains || {}).length : 0).map(([domain, info]) => {
+    const subs = info.subdomains || {};
+    const subKeys = Object.keys(subs);
+    const httpCount = subKeys.filter(key => subs[key]?.httpx).length;
+    const nucleiCount = subKeys.reduce((acc, key) => acc + (Array.isArray(subs[key]?.nuclei) ? subs[key].nuclei.length : 0), 0);
+    const niktoCount = subKeys.reduce((acc, key) => acc + (Array.isArray(subs[key]?.nikto) ? subs[key].nikto.length : 0), 0);
+    return `
+      <tr>
+        <td>${escapeHtml(domain)}</td>
+        <td>${subKeys.length}</td>
+        <td>${httpCount}</td>
+        <td>${nucleiCount}</td>
+        <td>${niktoCount}</td>
+        <td><button class="btn secondary" data-target-domain="${escapeHtml(domain)}">Open</button></td>
+      </tr>
+    `;
+  }).join('');
+  reportsBody.innerHTML = `
+    <div class="export-actions">
+      <a class="btn" href="/api/export/state" target="_blank">Download JSON</a>
+      <a class="btn secondary" href="/api/export/csv" target="_blank">Download CSV</a>
+    </div>
+    <div class="table-wrapper">
+      <table class="reports-table">
         <thead>
           <tr>
-            <th>#</th>
-            <th>Subdomain</th>
-            <th>Sources</th>
-            <th>HTTP</th>
-            <th>Nuclei</th>
-            <th>Nikto</th>
+            <th>Domain</th>
+            <th>Subdomains</th>
+            <th>HTTP entries</th>
+            <th>Nuclei findings</th>
+            <th>Nikto findings</th>
+            <th>Detail</th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
       </table>
-    ` : '<p class="muted">No subdomains collected yet.</p>';
-
-    cards.push(`<div class="target-card">${header}${table}</div>`);
-  });
-
-  container.innerHTML = cards.join('');
+    </div>
+  `;
 }
 
+reportsBody.addEventListener('click', (event) => {
+  const btn = event.target.closest('[data-target-domain]');
+  if (!btn) return;
+  const domain = btn.getAttribute('data-target-domain');
+  setView('targets');
+  const card = document.querySelector(`#targets-list .target-card[data-domain="${CSS.escape(domain)}"]`);
+  if (card) {
+    card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    card.classList.add('highlight');
+    setTimeout(() => card.classList.remove('highlight'), 2000);
+  }
+});
 function renderSettings(config, tools) {
-  const toolItems = Object.keys(tools || {}).sort().map(name => {
-    const path = tools[name];
-    const status = path ? `<span class="success">found</span> <code>${escapeHtml(path)}</code>` : '<span class="error">missing</span>';
-    return `<li><strong>${escapeHtml(name)}</strong>: ${status}</li>`;
-  }).join('');
-
   settingsSummary.innerHTML = `
-    <div class="settings-grid">
-      <div>
-        <strong>Results directory</strong>
-        <p><code>${escapeHtml(config.data_dir || '')}</code></p>
+    <div class="paths-grid">
+      <div><strong>Results directory</strong><br><code>${escapeHtml(config.data_dir || '')}</code></div>
+      <div><strong>state.json</strong><br><code>${escapeHtml(config.state_file || '')}</code></div>
+      <div><strong>dashboard.html</strong><br><code>${escapeHtml(config.dashboard_file || '')}</code></div>
+      <div><strong>Concurrency</strong><br>
+        Jobs: ${escapeHtml(config.max_running_jobs || 1)} ·
+        ffuf: ${escapeHtml(config.max_parallel_ffuf || 1)} ·
+        nuclei: ${escapeHtml(config.max_parallel_nuclei || 1)} ·
+        Nikto: ${escapeHtml(config.max_parallel_nikto || 1)}
       </div>
-      <div>
-        <strong>state.json</strong>
-        <p><code>${escapeHtml(config.state_file || '')}</code></p>
-      </div>
-      <div>
-        <strong>dashboard.html</strong>
-        <p><code>${escapeHtml(config.dashboard_file || '')}</code></p>
+      <div><strong>Enumerators</strong><br>
+        Amass: ${config.enable_amass === false ? 'disabled' : `enabled (timeout=${escapeHtml(config.amass_timeout || 600)}s)`} ·
+        Subfinder: ${config.enable_subfinder === false ? 'disabled' : `enabled (t=${escapeHtml(config.subfinder_threads || 32)})`} ·
+        Assetfinder: ${config.enable_assetfinder === false ? 'disabled' : `enabled (t=${escapeHtml(config.assetfinder_threads || 10)})`} ·
+        Findomain: ${config.enable_findomain === false ? 'disabled' : `enabled (t=${escapeHtml(config.findomain_threads || 40)})`} ·
+        Sublist3r: ${config.enable_sublist3r === false ? 'disabled' : 'enabled'}
       </div>
     </div>
-    <h4>Toolchain</h4>
-    <ul class="tool-list">${toolItems || '<li>No tool data.</li>'}</ul>
   `;
+  const toolItems = Object.keys(tools || {}).sort().map(name => {
+    const path = tools[name];
+    const pill = path ? '<span class="status-pill status-completed">Found</span>' : '<span class="status-pill status-error">Missing</span>';
+    const extra = path ? `<code>${escapeHtml(path)}</code>` : '';
+    return `<li><span>${escapeHtml(name)}</span><span class="tool-status">${pill} ${extra}</span></li>`;
+  }).join('') || '<li class="muted">No tool data.</li>';
+  toolsList.innerHTML = toolItems;
 
   if (!settingsFormDirty) {
     settingsWordlist.value = config.default_wordlist || '';
     settingsInterval.value = config.default_interval || 30;
     settingsSkipNikto.checked = !!config.skip_nikto_by_default;
+    settingsEnableAmass.checked = config.enable_amass !== false;
+    settingsAmassTimeout.value = config.amass_timeout || 600;
+    settingsEnableSubfinder.checked = config.enable_subfinder !== false;
+    settingsEnableAssetfinder.checked = config.enable_assetfinder !== false;
+    settingsEnableFindomain.checked = config.enable_findomain !== false;
+    settingsEnableSublist3r.checked = config.enable_sublist3r !== false;
+    settingsSubfinderThreads.value = config.subfinder_threads || 32;
+    settingsAssetfinderThreads.value = config.assetfinder_threads || 10;
+    settingsFindomainThreads.value = config.findomain_threads || 40;
+    settingsMaxJobs.value = config.max_running_jobs || 1;
+    settingsFFUF.value = config.max_parallel_ffuf || 1;
+    settingsNuclei.value = config.max_parallel_nuclei || 1;
+    settingsNikto.value = config.max_parallel_nikto || 1;
   }
 
   if (!launchFormDirty) {
@@ -1209,15 +2595,32 @@ async function fetchState() {
     const data = await resp.json();
     document.getElementById('last-updated').textContent = 'Last updated: ' + (data.last_updated || 'never');
     renderJobs(data.running_jobs || []);
+    renderQueue(data.queued_jobs || []);
     renderTargets(data.targets || {});
     renderSettings(data.config || {}, data.tools || {});
+    renderWorkers(data.workers || {});
+    renderReports(data.targets || {});
   } catch (err) {
-    document.getElementById('targets').innerHTML = `<p class="error">${escapeHtml(err.message)}</p>`;
+    targetsList.innerHTML = `<div class="section-placeholder">${escapeHtml(err.message)}</div>`;
   }
 }
 
 launchForm.addEventListener('input', () => { launchFormDirty = true; });
 settingsForm.addEventListener('input', () => { settingsFormDirty = true; });
+
+targetsList.addEventListener('click', (event) => {
+  const btn = event.target.closest('.sub-link');
+  if (!btn) return;
+  event.preventDefault();
+  const domain = btn.getAttribute('data-domain');
+  const sub = btn.getAttribute('data-sub');
+  openSubdomainDetail(domain, sub);
+});
+
+detailClose.addEventListener('click', () => closeDetailModal());
+detailOverlay.addEventListener('click', (event) => {
+  if (event.target === detailOverlay) closeDetailModal();
+});
 
 launchForm.addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -1255,6 +2658,19 @@ settingsForm.addEventListener('submit', async (event) => {
     default_wordlist: settingsWordlist.value,
     default_interval: settingsInterval.value,
     skip_nikto_by_default: settingsSkipNikto.checked,
+    enable_amass: settingsEnableAmass.checked,
+    amass_timeout: settingsAmassTimeout.value,
+    enable_subfinder: settingsEnableSubfinder.checked,
+    enable_assetfinder: settingsEnableAssetfinder.checked,
+    enable_findomain: settingsEnableFindomain.checked,
+    enable_sublist3r: settingsEnableSublist3r.checked,
+    subfinder_threads: settingsSubfinderThreads.value,
+    assetfinder_threads: settingsAssetfinderThreads.value,
+    findomain_threads: settingsFindomainThreads.value,
+    max_running_jobs: settingsMaxJobs.value,
+    max_parallel_ffuf: settingsFFUF.value,
+    max_parallel_nuclei: settingsNuclei.value,
+    max_parallel_nikto: settingsNikto.value,
   };
   settingsStatus.textContent = 'Saving...';
   settingsStatus.className = 'status';
@@ -1282,6 +2698,7 @@ setInterval(fetchState, POLL_INTERVAL);
 </script>
 </body>
 </html>
+
 """
 
 
@@ -1289,14 +2706,76 @@ def snapshot_running_jobs() -> List[Dict[str, Any]]:
     with JOB_LOCK:
         results = []
         for domain, job in RUNNING_JOBS.items():
+            steps = {name: dict(data) for name, data in (job.get("steps") or {}).items()}
+            thread_alive = bool(job.get("thread") and job["thread"].is_alive())
+            logs = [dict(entry) for entry in job.get("logs", [])]
             results.append({
                 "domain": domain,
                 "started": job.get("started"),
+                "queued_at": job.get("queued_at"),
+                "wordlist": job.get("wordlist") or "",
+                "skip_nikto": job.get("skip_nikto", False),
+                "interval": job.get("interval", DEFAULT_INTERVAL),
+                "status": job.get("status", "running"),
+                "message": job.get("message", ""),
+                "progress": job.get("progress", 0),
+                "last_update": job.get("last_update"),
+                "thread_alive": thread_alive,
+                "steps": steps,
+                "logs": logs,
+            })
+        return results
+
+
+def job_queue_snapshot() -> List[Dict[str, Any]]:
+    with JOB_LOCK:
+        snapshot = []
+        for position, domain in enumerate(JOB_QUEUE, start=1):
+            job = RUNNING_JOBS.get(domain)
+            if not job:
+                continue
+            snapshot.append({
+                "domain": domain,
+                "position": position,
+                "queued_at": job.get("queued_at"),
                 "wordlist": job.get("wordlist") or "",
                 "skip_nikto": job.get("skip_nikto", False),
                 "interval": job.get("interval", DEFAULT_INTERVAL),
             })
-        return results
+        return snapshot
+
+
+def snapshot_workers() -> Dict[str, Any]:
+    with JOB_LOCK:
+        active_jobs = count_active_jobs_locked()
+        queue_len = len(JOB_QUEUE)
+    tool_stats = {
+        name: gate.snapshot()
+        for name, gate in TOOL_GATES.items()
+    }
+
+
+def build_targets_csv(state: Dict[str, Any]) -> bytes:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["domain", "subdomains", "http_entries", "nuclei_findings", "nikto_findings"])
+    targets = state.get("targets", {})
+    for domain, info in sorted(targets.items()):
+        subs = info.get("subdomains", {})
+        sub_keys = subs.keys()
+        http_count = sum(1 for data in subs.values() if data.get("httpx"))
+        nuclei_count = sum(len(data.get("nuclei") or []) for data in subs.values())
+        nikto_count = sum(len(data.get("nikto") or []) for data in subs.values())
+        writer.writerow([domain, len(sub_keys), http_count, nuclei_count, nikto_count])
+    return output.getvalue().encode("utf-8")
+    return {
+        "job_slots": {
+            "limit": MAX_RUNNING_JOBS,
+            "active": active_jobs,
+            "queue": queue_len,
+        },
+        "tools": tool_stats,
+    }
 
 
 def start_pipeline_job(domain: str, wordlist: Optional[str], skip_nikto: bool, interval: Optional[int]) -> Tuple[bool, str]:
@@ -1312,30 +2791,38 @@ def start_pipeline_job(domain: str, wordlist: Optional[str], skip_nikto: bool, i
     else:
         wordlist_path = str(wordlist).strip()
 
-    def job():
-        try:
-            run_pipeline(normalized, wordlist_path or None, skip_nikto=skip_nikto, interval=interval_val)
-        finally:
-            with JOB_LOCK:
-                RUNNING_JOBS.pop(normalized, None)
-
-    thread = threading.Thread(target=job, name=f"pipeline-{normalized}", daemon=True)
-
     with JOB_LOCK:
-        existing = RUNNING_JOBS.get(normalized)
-        if existing and existing.get("thread") and existing["thread"].is_alive():
-            return False, f"A job for {normalized} is already running."
-        RUNNING_JOBS[normalized] = {
-            "thread": thread,
-            "started": datetime.now(timezone.utc).isoformat(),
+        if normalized in RUNNING_JOBS:
+            return False, f"A job for {normalized} already exists (status: {RUNNING_JOBS[normalized].get('status')})."
+        now = datetime.now(timezone.utc).isoformat()
+        job_record = {
+            "domain": normalized,
+            "thread": None,
+            "started": None,
+            "queued_at": now,
             "wordlist": wordlist_path,
             "skip_nikto": skip_nikto,
             "interval": interval_val,
+            "status": "queued",
+            "message": "Waiting for a free slot.",
+            "steps": init_job_steps(skip_nikto),
+            "progress": 0,
+            "last_update": now,
+            "logs": [],
         }
+        RUNNING_JOBS[normalized] = job_record
+        if count_active_jobs_locked() < MAX_RUNNING_JOBS:
+            start_now = True
+        else:
+            JOB_QUEUE.append(normalized)
+            start_now = False
 
-    log(f"Dispatching recon job for {normalized} (skip_nikto={skip_nikto}).")
-    thread.start()
-    return True, f"Recon started for {normalized}."
+    if start_now:
+        _start_job_thread(job_record)
+        return True, f"Recon started for {normalized}."
+
+    job_log_append(normalized, "Queued for execution.", "scheduler")
+    return True, f"{normalized} queued; it will start when a worker is free."
 
 
 def build_state_payload() -> Dict[str, Any]:
@@ -1346,8 +2833,10 @@ def build_state_payload() -> Dict[str, Any]:
         "last_updated": state.get("last_updated"),
         "targets": state.get("targets", {}),
         "running_jobs": snapshot_running_jobs(),
+        "queued_jobs": job_queue_snapshot(),
         "config": config,
         "tools": tool_info,
+        "workers": snapshot_workers(),
     }
 
 
@@ -1374,6 +2863,49 @@ class CommandCenterHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/settings":
             self._send_json({"config": get_config()})
+            return
+        if self.path.startswith("/api/history"):
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            domain = (params.get("domain") or [""])[0].strip().lower()
+            if not domain:
+                self._send_json({"success": False, "message": "domain parameter required"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            history_file = HISTORY_DIR / f"{domain}.jsonl"
+            events = []
+            if history_file.exists():
+                try:
+                    with history_file.open("r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                events.append(json.loads(line))
+                            except json.JSONDecodeError:
+                                continue
+                except Exception as exc:
+                    self._send_json({"success": False, "message": f"Failed to read history: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+            self._send_json({"domain": domain, "events": events[-1000:]})
+            return
+        if self.path == "/api/export/state":
+            data = json.dumps(load_state(), indent=2).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", 'attachment; filename="state.json"')
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if self.path == "/api/export/csv":
+            data = build_targets_csv(load_state())
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/csv")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", 'attachment; filename="targets.csv"')
+            self.end_headers()
+            self.wfile.write(data)
             return
         self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
