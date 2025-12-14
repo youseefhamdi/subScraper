@@ -210,6 +210,7 @@ def default_config() -> Dict[str, Any]:
         "data_dir": base,
         "state_file": str(STATE_FILE.resolve()),
         "dashboard_file": str(HTML_DASHBOARD_FILE.resolve()),
+        "screenshots_dir": str(SCREENSHOTS_DIR.resolve()),
         "default_interval": DEFAULT_INTERVAL,
         "default_wordlist": "",
         "skip_nikto_by_default": False,
@@ -574,6 +575,12 @@ def ensure_tool_installed(tool: str) -> bool:
         f"Checked binary name: {exe}"
     )
     return False
+
+
+def ensure_required_tools() -> None:
+    log("Verifying required tooling...")
+    for name in TOOLS.keys():
+        ensure_tool_installed(name)
 
 
 # ================== AMASS CONFIG ==================
@@ -1273,7 +1280,7 @@ def capture_screenshots(
         return {}
 
     recent_files: Dict[str, Path] = {}
-    cutoff = run_started - 5
+    cutoff = run_started
     for path in dest_dir.rglob("*.png"):
         try:
             mtime = path.stat().st_mtime
@@ -1451,6 +1458,7 @@ def add_subdomains_to_state(state: Dict[str, Any], domain: str, subs: List[str],
         })
         if "sources" not in entry:
             entry["sources"] = []
+        entry.setdefault("screenshot", None)
         if source not in entry["sources"]:
             entry["sources"].append(source)
 
@@ -1481,6 +1489,7 @@ def enrich_state_with_httpx(state: Dict[str, Any], domain: str, httpx_json: Path
                     "nikto": [],
                     "screenshot": None,
                 })
+                entry.setdefault("screenshot", None)
                 entry["httpx"] = {
                     "url": obj.get("url"),
                     "status_code": obj.get("status_code"),
@@ -1519,6 +1528,7 @@ def enrich_state_with_nuclei(state: Dict[str, Any], domain: str, nuclei_json: Pa
                     "nikto": [],
                     "screenshot": None,
                 })
+                entry.setdefault("screenshot", None)
                 finding = {
                     "template_id": obj.get("template-id"),
                     "name": (obj.get("info") or {}).get("name"),
@@ -1551,6 +1561,7 @@ def enrich_state_with_nikto(state: Dict[str, Any], domain: str, nikto_json: Path
                 "nikto": [],
                 "screenshot": None,
             })
+            entry.setdefault("screenshot", None)
             vulns = obj.get("vulnerabilities") or obj.get("vulns")
             if not vulns:
                 vulns = [obj]
@@ -2804,6 +2815,7 @@ function renderReports(targets) {
     const httpCount = subKeys.filter(key => subs[key]?.httpx).length;
     const nucleiCount = subKeys.reduce((acc, key) => acc + (Array.isArray(subs[key]?.nuclei) ? subs[key].nuclei.length : 0), 0);
     const niktoCount = subKeys.reduce((acc, key) => acc + (Array.isArray(subs[key]?.nikto) ? subs[key].nikto.length : 0), 0);
+    const screenshotCount = subKeys.filter(key => subs[key]?.screenshot).length;
     return `
       <tr>
         <td>${escapeHtml(domain)}</td>
@@ -2811,6 +2823,7 @@ function renderReports(targets) {
         <td>${httpCount}</td>
         <td>${nucleiCount}</td>
         <td>${niktoCount}</td>
+        <td>${screenshotCount}</td>
         <td><button class="btn secondary" data-target-domain="${escapeHtml(domain)}">Open</button></td>
       </tr>
     `;
@@ -2829,6 +2842,7 @@ function renderReports(targets) {
             <th>HTTP entries</th>
             <th>Nuclei findings</th>
             <th>Nikto findings</th>
+            <th>Screenshots</th>
             <th>Detail</th>
           </tr>
         </thead>
@@ -2856,18 +2870,21 @@ function renderSettings(config, tools) {
       <div><strong>Results directory</strong><br><code>${escapeHtml(config.data_dir || '')}</code></div>
       <div><strong>state.json</strong><br><code>${escapeHtml(config.state_file || '')}</code></div>
       <div><strong>dashboard.html</strong><br><code>${escapeHtml(config.dashboard_file || '')}</code></div>
+      <div><strong>screenshots</strong><br><code>${escapeHtml(config.screenshots_dir || '')}</code></div>
       <div><strong>Concurrency</strong><br>
         Jobs: ${escapeHtml(config.max_running_jobs || 1)} ·
         ffuf: ${escapeHtml(config.max_parallel_ffuf || 1)} ·
         nuclei: ${escapeHtml(config.max_parallel_nuclei || 1)} ·
-        Nikto: ${escapeHtml(config.max_parallel_nikto || 1)}
+        Nikto: ${escapeHtml(config.max_parallel_nikto || 1)} ·
+        Screenshots: ${escapeHtml(config.max_parallel_gowitness || 1)}
       </div>
       <div><strong>Enumerators</strong><br>
         Amass: ${config.enable_amass === false ? 'disabled' : `enabled (timeout=${escapeHtml(config.amass_timeout || 600)}s)`} ·
         Subfinder: ${config.enable_subfinder === false ? 'disabled' : `enabled (t=${escapeHtml(config.subfinder_threads || 32)})`} ·
         Assetfinder: ${config.enable_assetfinder === false ? 'disabled' : `enabled (t=${escapeHtml(config.assetfinder_threads || 10)})`} ·
         Findomain: ${config.enable_findomain === false ? 'disabled' : `enabled (t=${escapeHtml(config.findomain_threads || 40)})`} ·
-        Sublist3r: ${config.enable_sublist3r === false ? 'disabled' : 'enabled'}
+        Sublist3r: ${config.enable_sublist3r === false ? 'disabled' : 'enabled'} ·
+        Screenshots: ${config.enable_screenshots === false ? 'disabled' : 'enabled'}
       </div>
     </div>
   `;
@@ -2883,6 +2900,7 @@ function renderSettings(config, tools) {
     settingsWordlist.value = config.default_wordlist || '';
     settingsInterval.value = config.default_interval || 30;
     settingsSkipNikto.checked = !!config.skip_nikto_by_default;
+    settingsEnableScreenshots.checked = config.enable_screenshots !== false;
     settingsEnableAmass.checked = config.enable_amass !== false;
     settingsAmassTimeout.value = config.amass_timeout || 600;
     settingsEnableSubfinder.checked = config.enable_subfinder !== false;
@@ -2896,6 +2914,7 @@ function renderSettings(config, tools) {
     settingsFFUF.value = config.max_parallel_ffuf || 1;
     settingsNuclei.value = config.max_parallel_nuclei || 1;
     settingsNikto.value = config.max_parallel_nikto || 1;
+    settingsGowitness.value = config.max_parallel_gowitness || 1;
   }
 
   if (!launchFormDirty) {
@@ -2975,6 +2994,7 @@ settingsForm.addEventListener('submit', async (event) => {
     default_wordlist: settingsWordlist.value,
     default_interval: settingsInterval.value,
     skip_nikto_by_default: settingsSkipNikto.checked,
+    enable_screenshots: settingsEnableScreenshots.checked,
     enable_amass: settingsEnableAmass.checked,
     amass_timeout: settingsAmassTimeout.value,
     enable_subfinder: settingsEnableSubfinder.checked,
@@ -2988,6 +3008,7 @@ settingsForm.addEventListener('submit', async (event) => {
     max_parallel_ffuf: settingsFFUF.value,
     max_parallel_nuclei: settingsNuclei.value,
     max_parallel_nikto: settingsNikto.value,
+    max_parallel_gowitness: settingsGowitness.value,
   };
   settingsStatus.textContent = 'Saving...';
   settingsStatus.className = 'status';
@@ -3070,21 +3091,6 @@ def snapshot_workers() -> Dict[str, Any]:
         name: gate.snapshot()
         for name, gate in TOOL_GATES.items()
     }
-
-
-def build_targets_csv(state: Dict[str, Any]) -> bytes:
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["domain", "subdomains", "http_entries", "nuclei_findings", "nikto_findings"])
-    targets = state.get("targets", {})
-    for domain, info in sorted(targets.items()):
-        subs = info.get("subdomains", {})
-        sub_keys = subs.keys()
-        http_count = sum(1 for data in subs.values() if data.get("httpx"))
-        nuclei_count = sum(len(data.get("nuclei") or []) for data in subs.values())
-        nikto_count = sum(len(data.get("nikto") or []) for data in subs.values())
-        writer.writerow([domain, len(sub_keys), http_count, nuclei_count, nikto_count])
-    return output.getvalue().encode("utf-8")
     return {
         "job_slots": {
             "limit": MAX_RUNNING_JOBS,
@@ -3093,6 +3099,22 @@ def build_targets_csv(state: Dict[str, Any]) -> bytes:
         },
         "tools": tool_stats,
     }
+
+
+def build_targets_csv(state: Dict[str, Any]) -> bytes:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["domain", "subdomains", "http_entries", "nuclei_findings", "nikto_findings", "screenshots"])
+    targets = state.get("targets", {})
+    for domain, info in sorted(targets.items()):
+        subs = info.get("subdomains", {})
+        sub_keys = subs.keys()
+        http_count = sum(1 for data in subs.values() if data.get("httpx"))
+        nuclei_count = sum(len(data.get("nuclei") or []) for data in subs.values())
+        nikto_count = sum(len(data.get("nikto") or []) for data in subs.values())
+        screenshot_count = sum(1 for data in subs.values() if data.get("screenshot"))
+        writer.writerow([domain, len(sub_keys), http_count, nuclei_count, nikto_count, screenshot_count])
+    return output.getvalue().encode("utf-8")
 
 
 def start_pipeline_job(domain: str, wordlist: Optional[str], skip_nikto: bool, interval: Optional[int]) -> Tuple[bool, str]:
@@ -3344,6 +3366,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    ensure_dirs()
+    ensure_required_tools()
 
     if args.domain:
         log(f"Running single pipeline execution for {args.domain}.")
