@@ -4644,7 +4644,6 @@ function buildDetailHtml(domain, sub, info, history) {
   const screenshot = info.screenshot || {};
   const nuclei = info.nuclei || [];
   const nikto = info.nikto || [];
-  const nmap = info.nmap || {};
   const filteredHistory = history.filter(event => {
     const text = (event.text || '').toLowerCase();
     const src = (event.source || '').toLowerCase();
@@ -4698,53 +4697,6 @@ function buildDetailHtml(domain, sub, info, history) {
       ` : '<p class="muted">No screenshot available</p>'}
     </div>
   `;
-  
-  // Nmap section - port scan results table
-  let nmapHtml = '<div class="detail-section"><h4>Nmap Port Scan</h4>';
-  if (nmap.scan_output) {
-    // Parse nmap output for port information
-    const lines = (nmap.scan_output || '').split('\n');
-    const portLines = lines.filter(line => /^\d+\/\w+\s+\w+\s+/.test(line.trim()));
-    if (portLines.length > 0) {
-      nmapHtml += `
-        <div class="table-wrapper">
-          <table class="targets-table">
-            <thead>
-              <tr>
-                <th>Port</th>
-                <th>State</th>
-                <th>Service</th>
-                <th>Version</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${portLines.map(line => {
-                const parts = line.trim().split(/\s+/);
-                const port = parts[0] || '';
-                const state = parts[1] || '';
-                const service = parts[2] || '';
-                const version = parts.slice(3).join(' ') || '—';
-                return `
-                  <tr>
-                    <td>${escapeHtml(port)}</td>
-                    <td>${escapeHtml(state)}</td>
-                    <td>${escapeHtml(service)}</td>
-                    <td>${escapeHtml(version)}</td>
-                  </tr>
-                `;
-              }).join('')}
-            </tbody>
-          </table>
-        </div>
-        ${nmap.timestamp ? `<p class="muted" style="margin-top:8px;">Scanned at ${fmtTime(nmap.timestamp)}</p>` : ''}
-      `;
-    } else {
-      nmapHtml += `<p class="muted">Scan completed but no open ports found</p>`;
-    }
-  } else {
-    nmapHtml += '<p class="muted">No port scan data available</p>';
-  }
-  nmapHtml += '</div>';
   
   // URLs section - placeholder for future implementation
   const urlsHtml = `
@@ -4847,7 +4799,6 @@ function buildDetailHtml(domain, sub, info, history) {
     ${metadataHtml}
     ${httpHtml}
     ${screenshotHtml}
-    ${nmapHtml}
     ${urlsHtml}
     ${nucleiHtml}
     ${niktoHtml}
