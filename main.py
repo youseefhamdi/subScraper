@@ -343,7 +343,6 @@ SYSTEM_RESOURCE_POLL_INTERVAL = 5  # Poll every 5 seconds
 SYSTEM_RESOURCE_HISTORY_SIZE = 720  # Keep 1 hour of history at 5-second intervals
 SYSTEM_RESOURCE_HISTORY: List[Dict[str, Any]] = []
 SYSTEM_RESOURCE_FILE = DATA_DIR / "system_resources.json"
-MAX_MONITOR_ENTRIES = 200
 
 
 # ================== UTILITIES =======================
@@ -1028,6 +1027,9 @@ def system_resource_worker_loop() -> None:
     """Background worker that continuously monitors system resources."""
     log("System resource monitoring worker started.")
     
+    last_save_time = time.time()
+    save_interval = 60  # Save every 60 seconds
+    
     while True:
         try:
             # Collect current metrics
@@ -1063,10 +1065,12 @@ def system_resource_worker_loop() -> None:
                 if len(SYSTEM_RESOURCE_HISTORY) > SYSTEM_RESOURCE_HISTORY_SIZE:
                     SYSTEM_RESOURCE_HISTORY[:] = SYSTEM_RESOURCE_HISTORY[-SYSTEM_RESOURCE_HISTORY_SIZE:]
             
-            # Save state periodically (every minute to reduce I/O)
-            if len(SYSTEM_RESOURCE_HISTORY) % 12 == 0:  # Every 12 * 5 = 60 seconds
+            # Save state periodically using timestamp-based approach
+            current_time = time.time()
+            if current_time - last_save_time >= save_interval:
                 try:
                     save_system_resource_state()
+                    last_save_time = current_time
                 except Exception as exc:
                     log(f"Error saving system resource state: {exc}")
             
