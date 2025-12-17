@@ -345,6 +345,8 @@ def default_config() -> Dict[str, Any]:
         "max_parallel_gowitness": 1,
         "max_parallel_nmap": 1,
         "enable_nmap": True,
+        "nmap_timeout": 300,
+        "max_nmap_output_size": 5000,
         "max_running_jobs": 1,
         "tool_flag_templates": {name: "" for name in TEMPLATE_AWARE_TOOLS},
     }
@@ -2068,6 +2070,15 @@ def nmap_scan(subs: List[str], domain: str, config: Optional[Dict[str, Any]] = N
         log(f"Running nmap against {host}")
         if job_domain:
             job_log_append(job_domain, f"Nmap scanning {host}", source="nmap")
+        
+        # Get configurable timeout, default to 300 seconds (5 minutes)
+        nmap_timeout = 300
+        if config:
+            try:
+                nmap_timeout = max(60, int(config.get("nmap_timeout", 300)))
+            except (TypeError, ValueError):
+                nmap_timeout = 300
+        
         try:
             proc = subprocess.run(
                 cmd,
@@ -2075,7 +2086,7 @@ def nmap_scan(subs: List[str], domain: str, config: Optional[Dict[str, Any]] = N
                 stderr=subprocess.PIPE,
                 text=True,
                 check=False,
-                timeout=300,  # 5 minute timeout per host
+                timeout=nmap_timeout,
             )
         except FileNotFoundError:
             log("Nmap binary not found during run.")
@@ -2096,12 +2107,13 @@ def nmap_scan(subs: List[str], domain: str, config: Optional[Dict[str, Any]] = N
         if job_domain and stderr_text:
             job_log_append(job_domain, stderr_text, source="nmap stderr")
 
-        # Parse basic nmap output - just store the raw XML for now
-        # In a production system, you'd parse the XML properly
+        # Store nmap XML output (raw format for future parsing)
+        # Output is stored as-is; consider implementing XML parsing for structured data extraction
         if stdout_text.strip():
+            max_output_size = config.get("max_nmap_output_size", 5000) if config else 5000
             results.append({
                 "host": host,
-                "scan_output": stdout_text[:5000],  # Limit output size
+                "scan_output": stdout_text[:max_output_size],  # Limit output size to prevent excessive storage
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
             if job_domain:
@@ -4085,7 +4097,7 @@ function renderWorkers(workers) {
     const active = info.active || 0;
     
     // Handle tools with and without concurrency gates
-    if (limit === null || limit === undefined) {
+    if (limit == null) {
       // Tool without gate - just show as available
       return `
         <div class="worker-card">
