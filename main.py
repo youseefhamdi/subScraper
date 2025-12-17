@@ -23,6 +23,7 @@ import json
 import mimetypes
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -71,6 +72,18 @@ TOOLS = {
 
 CONFIG_LOCK = threading.Lock()
 CONFIG: Dict[str, Any] = {}
+TEMPLATE_AWARE_TOOLS = [
+    "amass",
+    "subfinder",
+    "assetfinder",
+    "findomain",
+    "sublist3r",
+    "ffuf",
+    "httpx",
+    "nuclei",
+    "nikto",
+    "gowitness",
+]
 
 
 class ToolGate:
@@ -188,6 +201,56 @@ def ensure_dirs() -> None:
     SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _normalize_tool_flag_templates(value: Any) -> Dict[str, str]:
+    mapping = {name: "" for name in TEMPLATE_AWARE_TOOLS}
+    if not isinstance(value, dict):
+        return mapping
+    for name in TEMPLATE_AWARE_TOOLS:
+        if name in value:
+            mapping[name] = str(value.get(name) or "").strip()
+    return mapping
+
+
+def get_tool_flag_template(tool: str, config: Optional[Dict[str, Any]] = None) -> str:
+    cfg = config or get_config()
+    templates = _normalize_tool_flag_templates(cfg.get("tool_flag_templates"))
+    return templates.get(tool, "")
+
+
+def render_template_args(template: str, context: Dict[str, Any], tool: str) -> List[str]:
+    if not template or not str(template).strip():
+        return []
+
+    def replacer(match: re.Match) -> str:
+        key = match.group(1).upper()
+        return str(context.get(key, ""))
+
+    try:
+        expanded = re.sub(r"\$(\w+)\$", replacer, str(template))
+    except re.error as exc:
+        log(f"Regex error while parsing template for {tool}: {exc}")
+        return []
+    try:
+        parsed = shlex.split(expanded)
+    except ValueError as exc:
+        log(f"Template parse error for {tool}: {exc}")
+        parsed = expanded.split()
+    return [arg for arg in parsed if str(arg).strip()]
+
+
+def apply_template_flags(
+    tool: str,
+    cmd: List[str],
+    context: Dict[str, Any],
+    config: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    template = get_tool_flag_template(tool, config)
+    extras = render_template_args(template, context, tool)
+    if not extras:
+        return cmd
+    return cmd + extras
+
+
 def apply_concurrency_limits(cfg: Dict[str, Any]) -> None:
     global MAX_RUNNING_JOBS
     try:
@@ -277,6 +340,7 @@ def default_config() -> Dict[str, Any]:
         "max_parallel_nikto": 1,
         "max_parallel_gowitness": 1,
         "max_running_jobs": 1,
+        "tool_flag_templates": {name: "" for name in TEMPLATE_AWARE_TOOLS},
     }
 
 
@@ -550,6 +614,7 @@ def load_config() -> Dict[str, Any]:
             log(f"Error loading config.json: {e}")
     else:
         save_config(cfg)
+    cfg["tool_flag_templates"] = _normalize_tool_flag_templates(cfg.get("tool_flag_templates"))
     with CONFIG_LOCK:
         CONFIG.clear()
         CONFIG.update(cfg)
@@ -714,6 +779,12 @@ def update_config_settings(values: Dict[str, Any]) -> Tuple[bool, str, Dict[str,
             if cfg.get(field, 1) != new_limit:
                 cfg[field] = new_limit
                 changed = True
+
+    if "tool_flag_templates" in values:
+        new_templates = _normalize_tool_flag_templates(values.get("tool_flag_templates"))
+        if cfg.get("tool_flag_templates", {}) != new_templates:
+            cfg["tool_flag_templates"] = new_templates
+            changed = True
 
     if changed:
         save_config(cfg)
@@ -1120,6 +1191,12 @@ def amass_enum(domain: str, config: Optional[Dict[str, Any]] = None, job_domain:
         "-d", domain,
         "-oA", str(out_base),
     ] + extra_args
+    context = {
+        "DOMAIN": domain,
+        "OUTPUT_PREFIX": str(out_base),
+        "OUTPUT_JSON": str(out_json),
+    }
+    cmd = apply_template_flags("amass", cmd, context, config)
     success = run_subprocess(cmd, job_domain=job_domain, step="amass", timeout=timeout)
     return out_json if success and out_json.exists() else None
 
@@ -1183,6 +1260,12 @@ def subfinder_enum(domain: str, config: Optional[Dict[str, Any]] = None, job_dom
         "-t", str(threads),
         "-o", str(out_path),
     ]
+    context = {
+        "DOMAIN": domain,
+        "OUTPUT": str(out_path),
+        "THREADS": threads,
+    }
+    cmd = apply_template_flags("subfinder", cmd, context, config)
     success = run_subprocess(cmd, outfile=out_path, job_domain=job_domain, step="subfinder")
     return read_lines_file(out_path) if success else []
 
@@ -1202,6 +1285,12 @@ def assetfinder_enum(domain: str, config: Optional[Dict[str, Any]] = None, job_d
         "--subs-only",
         domain,
     ]
+    context = {
+        "DOMAIN": domain,
+        "OUTPUT": str(out_path),
+        "THREADS": threads,
+    }
+    cmd = apply_template_flags("assetfinder", cmd, context, config)
     success = run_subprocess(
         cmd,
         outfile=out_path,
@@ -1229,6 +1318,12 @@ def findomain_enum(domain: str, config: Optional[Dict[str, Any]] = None, job_dom
         "--quiet",
         "--output", str(out_path),
     ]
+    context = {
+        "DOMAIN": domain,
+        "OUTPUT": str(out_path),
+        "THREADS": threads,
+    }
+    cmd = apply_template_flags("findomain", cmd, context, config)
     success = run_subprocess(cmd, outfile=out_path, job_domain=job_domain, step="findomain")
     return read_lines_file(out_path) if success else []
 
@@ -1242,6 +1337,11 @@ def sublist3r_enum(domain: str, job_domain: Optional[str] = None) -> List[str]:
         "-d", domain,
         "-o", str(out_path),
     ]
+    context = {
+        "DOMAIN": domain,
+        "OUTPUT": str(out_path),
+    }
+    cmd = apply_template_flags("sublist3r", cmd, context)
     success = run_subprocess(cmd, outfile=out_path, job_domain=job_domain, step="sublist3r")
     return read_lines_file(out_path) if success else []
 
@@ -1361,7 +1461,7 @@ def run_downstream_pipeline(
             with TOOL_GATES["ffuf"]:
                 if job_domain:
                     job_log_append(job_domain, "ffuf slot acquired.", "scheduler")
-                subs_ffuf = ffuf_bruteforce(domain, wordlist, job_domain=job_domain)
+                subs_ffuf = ffuf_bruteforce(domain, wordlist, config=config, job_domain=job_domain)
             log(f"ffuf found {len(subs_ffuf)} vhost subdomains.")
             add_subdomains_to_state(state, domain, subs_ffuf, "ffuf")
             flags["ffuf_done"] = True
@@ -1393,7 +1493,7 @@ def run_downstream_pipeline(
             continue
         update_step("httpx", status="running", message=f"httpx scanning {len(new_hosts)} pending hosts", progress=40)
         batch_file = write_subdomains_file(domain, new_hosts, suffix="_httpx_batch")
-        httpx_json = httpx_scan(batch_file, domain, job_domain=job_domain)
+        httpx_json = httpx_scan(batch_file, domain, config=config, job_domain=job_domain)
         try:
             batch_file.unlink()
         except FileNotFoundError:
@@ -1437,7 +1537,7 @@ def run_downstream_pipeline(
             with TOOL_GATES["gowitness"]:
                 if job_domain:
                     job_log_append(job_domain, "Screenshot slot acquired.", "scheduler")
-                screenshot_map = capture_screenshots(screenshot_targets, domain, job_domain=job_domain)
+                screenshot_map = capture_screenshots(screenshot_targets, domain, config=config, job_domain=job_domain)
             if not screenshot_map:
                 job_log_append(job_domain, "Screenshot batch failed.", "screenshots")
                 update_step("screenshots", status="error", message="Screenshot capture failed.", progress=100)
@@ -1476,7 +1576,7 @@ def run_downstream_pipeline(
         with TOOL_GATES["nuclei"]:
             if job_domain:
                 job_log_append(job_domain, "nuclei slot acquired.", "scheduler")
-            nuclei_json = nuclei_scan(batch_file, domain, job_domain=job_domain)
+            nuclei_json = nuclei_scan(batch_file, domain, config=config, job_domain=job_domain)
         try:
             batch_file.unlink()
         except FileNotFoundError:
@@ -1527,7 +1627,7 @@ def run_downstream_pipeline(
             with TOOL_GATES["nikto"]:
                 if job_domain:
                     job_log_append(job_domain, "Nikto slot acquired.", "scheduler")
-                nikto_json = nikto_scan(new_hosts, domain, job_domain=job_domain)
+                nikto_json = nikto_scan(new_hosts, domain, config=config, job_domain=job_domain)
             if not nikto_json:
                 job_log_append(job_domain, "Nikto batch failed.", "nikto")
                 update_step("nikto", status="error", message="Nikto batch failed. Check logs for details.", progress=100)
@@ -1541,7 +1641,12 @@ def run_downstream_pipeline(
     log("Pipeline finished for this run.")
 
 
-def ffuf_bruteforce(domain: str, wordlist: str, job_domain: Optional[str] = None) -> List[str]:
+def ffuf_bruteforce(
+    domain: str,
+    wordlist: str,
+    config: Optional[Dict[str, Any]] = None,
+    job_domain: Optional[str] = None,
+) -> List[str]:
     """
     Use ffuf to brute-force vhosts via Host header.
     This is HTTP-based vhost brute, not pure DNS brute, but still useful.
@@ -1561,6 +1666,14 @@ def ffuf_bruteforce(domain: str, wordlist: str, job_domain: Optional[str] = None
         "-o", str(out_json),
         "-mc", "200,301,302,403,401"
     ]
+    context = {
+        "DOMAIN": domain,
+        "WORDLIST": wordlist,
+        "OUTPUT": str(out_json),
+        "TARGET_URL": f"http://{domain}",
+        "HOST_HEADER": f"FUZZ.{domain}",
+    }
+    cmd = apply_template_flags("ffuf", cmd, context, config)
     success = run_subprocess(cmd, job_domain=job_domain, step="ffuf")
     if not success or not out_json.exists():
         return []
@@ -1592,7 +1705,8 @@ def write_subdomains_file(domain: str, subs: List[str], suffix: Optional[str] = 
     return out_path
 
 
-def httpx_scan(subs_file: Path, domain: str, job_domain: Optional[str] = None) -> Path:
+def httpx_scan(subs_file: Path, domain: str, config: Optional[Dict[str, Any]] = None,
+               job_domain: Optional[str] = None) -> Path:
     if not ensure_tool_installed("httpx"):
         return None
     out_json = DATA_DIR / f"httpx_{domain}.json"
@@ -1605,6 +1719,12 @@ def httpx_scan(subs_file: Path, domain: str, job_domain: Optional[str] = None) -
         "-follow-redirects",
         "-v",
     ]
+    context = {
+        "DOMAIN": domain,
+        "INPUT_FILE": str(subs_file),
+        "OUTPUT": str(out_json),
+    }
+    cmd = apply_template_flags("httpx", cmd, context, config)
     success = run_subprocess(cmd, job_domain=job_domain, step="httpx")
     return out_json if success and out_json.exists() else None
 
@@ -1636,6 +1756,7 @@ def gather_screenshot_targets(state: Dict[str, Any], domain: str) -> List[Tuple[
 def capture_screenshots(
     targets: List[Tuple[str, str]],
     domain: str,
+    config: Optional[Dict[str, Any]] = None,
     job_domain: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
     if not targets:
@@ -1664,6 +1785,13 @@ def capture_screenshots(
         "--db", str(db_path),
         "--log-level", "error",
     ]
+    context = {
+        "DOMAIN": domain,
+        "TARGETS_FILE": str(target_file),
+        "OUTPUT_DIR": str(dest_dir),
+        "DB_PATH": str(db_path),
+    }
+    cmd = apply_template_flags("gowitness", cmd, context, config)
     success = run_subprocess(cmd, job_domain=job_domain, step="screenshots")
     try:
         target_file.unlink(missing_ok=True)
@@ -1710,7 +1838,8 @@ def capture_screenshots(
     return mapping
 
 
-def nuclei_scan(subs_file: Path, domain: str, job_domain: Optional[str] = None) -> Path:
+def nuclei_scan(subs_file: Path, domain: str, config: Optional[Dict[str, Any]] = None,
+                job_domain: Optional[str] = None) -> Path:
     if not ensure_tool_installed("nuclei"):
         return None
     out_json = DATA_DIR / f"nuclei_{domain}.json"
@@ -1719,6 +1848,12 @@ def nuclei_scan(subs_file: Path, domain: str, job_domain: Optional[str] = None) 
         "-l", str(subs_file),
         "-jsonl",
     ]
+    context = {
+        "DOMAIN": domain,
+        "INPUT_FILE": str(subs_file),
+        "OUTPUT": str(out_json),
+    }
+    cmd = apply_template_flags("nuclei", cmd, context, config)
     success = run_subprocess(cmd, outfile=out_json, job_domain=job_domain, step="nuclei")
     return out_json if success and out_json.exists() else None
 
@@ -1787,7 +1922,8 @@ def _parse_nikto_output(host: str, stdout_text: str) -> List[Dict[str, Any]]:
     return findings
 
 
-def nikto_scan(subs: List[str], domain: str, job_domain: Optional[str] = None) -> Path:
+def nikto_scan(subs: List[str], domain: str, config: Optional[Dict[str, Any]] = None,
+               job_domain: Optional[str] = None) -> Path:
     if not ensure_tool_installed("nikto"):
         return None
     out_json = DATA_DIR / f"nikto_{domain}.json"
@@ -1799,6 +1935,13 @@ def nikto_scan(subs: List[str], domain: str, job_domain: Optional[str] = None) -
             TOOLS["nikto"],
             "-h", target,
         ]
+        context = {
+            "DOMAIN": domain,
+            "SUBDOMAIN": host,
+            "TARGET_URL": target,
+            "OUTPUT": str(out_json),
+        }
+        cmd = apply_template_flags("nikto", cmd, context, config)
         log(f"Running nikto against {target}")
         if job_domain:
             job_log_append(job_domain, f"Nikto scanning {target}", source="nikto")
@@ -2825,6 +2968,9 @@ button:hover { background:#1d4ed8; }
 .tool-list li:last-child { border-bottom:none; }
 .tool-status { font-size:12px; display:flex; gap:6px; align-items:center; }
 .tips { list-style:disc; margin:12px 0 0 18px; color:var(--muted); font-size:13px; }
+.template-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; margin-top:10px; }
+.template-input { width:100%; min-height:56px; background:#0b152c; border:1px solid #1f2937; color:var(--text); border-radius:8px; padding:10px; font-family:'JetBrains Mono','Fira Code','SFMono-Regular',monospace; font-size:12px; }
+.template-note { margin:8px 0 0; color:var(--muted); font-size:12px; }
 @media (max-width: 900px) {
   .app-shell { flex-direction:column; }
   .sidebar { width:100%; height:auto; position:relative; }
@@ -2850,6 +2996,7 @@ button:hover { background:#1d4ed8; }
       <a class="nav-link" data-view="monitors" href="#monitors">Monitors</a>
       <a class="nav-link" data-view="targets" href="#targets">Targets</a>
       <a class="nav-link" data-view="settings" href="#settings">Settings</a>
+      <a class="nav-link" data-view="guide" href="#guide">User Guide</a>
     </nav>
     <div class="sidebar-footer">
       Outputs live in <code>recon_data/</code>. Keep this UI open while jobs run.
@@ -3054,6 +3201,41 @@ button:hover { background:#1d4ed8; }
               <label>Screenshot parallel slots
                 <input id="settings-gowitness" type="number" name="max_parallel_gowitness" min="1" />
               </label>
+              <h4>Command templates</h4>
+              <p class="muted">Customize flags for each tool with variables such as <code>$DOMAIN$</code>, <code>$WORDLIST$</code>, <code>$OUTPUT$</code>, <code>$OUTPUT_JSON$</code>, <code>$INPUT_FILE$</code>, <code>$TARGET_URL$</code>, <code>$SUBDOMAIN$</code>, <code>$TARGETS_FILE$</code>, <code>$OUTPUT_PREFIX$</code>, <code>$OUTPUT_DIR$</code>, <code>$DB_PATH$</code>, <code>$THREADS$</code>, and <code>$HOST_HEADER$</code>.</p>
+              <div class="template-grid">
+                <label>Amass flags
+                  <textarea id="template-amass" class="template-input" placeholder="-passive"></textarea>
+                </label>
+                <label>Subfinder flags
+                  <textarea id="template-subfinder" class="template-input" placeholder="-all"></textarea>
+                </label>
+                <label>Assetfinder flags
+                  <textarea id="template-assetfinder" class="template-input" placeholder=""></textarea>
+                </label>
+                <label>Findomain flags
+                  <textarea id="template-findomain" class="template-input" placeholder=""></textarea>
+                </label>
+                <label>Sublist3r flags
+                  <textarea id="template-sublist3r" class="template-input" placeholder=""></textarea>
+                </label>
+                <label>ffuf flags
+                  <textarea id="template-ffuf" class="template-input" placeholder="-rate 50"></textarea>
+                </label>
+                <label>httpx flags
+                  <textarea id="template-httpx" class="template-input" placeholder="-silent"></textarea>
+                </label>
+                <label>nuclei flags
+                  <textarea id="template-nuclei" class="template-input" placeholder="-severity medium,high"></textarea>
+                </label>
+                <label>Nikto flags
+                  <textarea id="template-nikto" class="template-input" placeholder=""></textarea>
+                </label>
+                <label>Screenshot flags (gowitness)
+                  <textarea id="template-gowitness" class="template-input" placeholder=""></textarea>
+                </label>
+              </div>
+              <p class="template-note">Tip: leave a field blank to use the built-in defaults. Need examples? Visit the User Guide from the sidebar.</p>
               <button type="submit">Save Settings</button>
             </form>
             <div class="status" id="settings-status"></div>
@@ -3064,6 +3246,43 @@ button:hover { background:#1d4ed8; }
               <li class="muted">Detecting tool paths…</li>
             </ul>
           </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="module" data-view="guide">
+      <div class="module-header"><h2>User Guide</h2></div>
+      <div class="module-body">
+        <div class="card">
+          <h3>Launching targets</h3>
+          <ul class="tips">
+            <li>Enter a domain like <code>example.com</code> or use a wildcard suffix such as <code>example.*</code> to fan out across configured TLDs. Configure the allowed TLD list under <strong>Settings → Wildcard TLDs</strong>.</li>
+            <li>Prefix with <code>*.</code> to scan a sub-scope, e.g., <code>*.apps.example.com</code> will recurse under that subdomain while still honoring wildcard TLD expansion when paired with <code>.*</code>.</li>
+            <li>Provide a wordlist path if you want ffuf vhost brute-forcing; leave it blank to skip ffuf automatically.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Templated tool flags</h3>
+          <p>Each tool runs with built-in safe defaults. Any text you add in the Command templates settings will be appended to the underlying command <em>after</em> placeholder expansion. Leave a template blank to keep defaults.</p>
+          <p>Supported placeholders are replaced per run: <code>$DOMAIN$</code>, <code>$SUBDOMAIN$</code>, <code>$WORDLIST$</code>, <code>$OUTPUT$</code>, <code>$OUTPUT_JSON$</code>, <code>$OUTPUT_PREFIX$</code>, <code>$INPUT_FILE$</code>, <code>$TARGET_URL$</code>, <code>$TARGETS_FILE$</code>, <code>$OUTPUT_DIR$</code>, <code>$DB_PATH$</code>, <code>$THREADS$</code>, and <code>$HOST_HEADER$</code>.</p>
+          <div class="table-wrapper">
+            <table class="monitor-entry-table">
+              <thead><tr><th>Tool</th><th>Context variables you can use</th></tr></thead>
+              <tbody>
+                <tr><td>Amass</td><td><code>$DOMAIN$</code>, <code>$OUTPUT_PREFIX$</code>, <code>$OUTPUT_JSON$</code></td></tr>
+                <tr><td>Subfinder</td><td><code>$DOMAIN$</code>, <code>$OUTPUT$</code>, <code>$THREADS$</code></td></tr>
+                <tr><td>Assetfinder</td><td><code>$DOMAIN$</code>, <code>$OUTPUT$</code>, <code>$THREADS$</code></td></tr>
+                <tr><td>Findomain</td><td><code>$DOMAIN$</code>, <code>$OUTPUT$</code>, <code>$THREADS$</code></td></tr>
+                <tr><td>Sublist3r</td><td><code>$DOMAIN$</code>, <code>$OUTPUT$</code></td></tr>
+                <tr><td>ffuf</td><td><code>$DOMAIN$</code>, <code>$WORDLIST$</code>, <code>$OUTPUT$</code>, <code>$TARGET_URL$</code>, <code>$HOST_HEADER$</code></td></tr>
+                <tr><td>httpx</td><td><code>$DOMAIN$</code>, <code>$INPUT_FILE$</code>, <code>$OUTPUT$</code></td></tr>
+                <tr><td>nuclei</td><td><code>$DOMAIN$</code>, <code>$INPUT_FILE$</code>, <code>$OUTPUT$</code></td></tr>
+                <tr><td>Nikto</td><td><code>$DOMAIN$</code>, <code>$SUBDOMAIN$</code>, <code>$TARGET_URL$</code>, <code>$OUTPUT$</code></td></tr>
+                <tr><td>Gowitness (screenshots)</td><td><code>$DOMAIN$</code>, <code>$TARGETS_FILE$</code>, <code>$OUTPUT_DIR$</code>, <code>$DB_PATH$</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="template-note">Examples: add <code>-passive</code> to Amass, <code>-rate 50</code> to ffuf, or <code>-severity medium,high,critical</code> to nuclei. Use <code>$OUTPUT$</code> to change where a tool writes extra logs.</p>
         </div>
       </div>
     </section>
@@ -3143,6 +3362,18 @@ const settingsNikto = document.getElementById('settings-nikto');
 const settingsGowitness = document.getElementById('settings-gowitness');
 const settingsStatus = document.getElementById('settings-status');
 const settingsSummary = document.getElementById('settings-summary');
+const templateInputs = {
+  amass: document.getElementById('template-amass'),
+  subfinder: document.getElementById('template-subfinder'),
+  assetfinder: document.getElementById('template-assetfinder'),
+  findomain: document.getElementById('template-findomain'),
+  sublist3r: document.getElementById('template-sublist3r'),
+  ffuf: document.getElementById('template-ffuf'),
+  httpx: document.getElementById('template-httpx'),
+  nuclei: document.getElementById('template-nuclei'),
+  nikto: document.getElementById('template-nikto'),
+  gowitness: document.getElementById('template-gowitness'),
+};
 const monitorForm = document.getElementById('monitor-form');
 const monitorName = document.getElementById('monitor-name');
 const monitorUrl = document.getElementById('monitor-url');
@@ -4536,6 +4767,11 @@ function renderSettings(config, tools) {
     settingsNuclei.value = config.max_parallel_nuclei || 1;
     settingsNikto.value = config.max_parallel_nikto || 1;
     settingsGowitness.value = config.max_parallel_gowitness || 1;
+    const templateValues = config.tool_flag_templates || {};
+    Object.entries(templateInputs).forEach(([key, el]) => {
+      if (!el) return;
+      el.value = templateValues[key] || '';
+    });
   }
 
   if (!launchFormDirty) {
@@ -4636,6 +4872,12 @@ settingsForm.addEventListener('submit', async (event) => {
     max_parallel_nikto: settingsNikto.value,
     max_parallel_gowitness: settingsGowitness.value,
   };
+  const templatePayload = {};
+  Object.entries(templateInputs).forEach(([key, el]) => {
+    if (!el) return;
+    templatePayload[key] = el.value || '';
+  });
+  payload.tool_flag_templates = templatePayload;
   settingsStatus.textContent = 'Saving...';
   settingsStatus.className = 'status';
   try {
