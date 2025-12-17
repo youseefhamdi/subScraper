@@ -26,7 +26,9 @@ Recon Command Center is a single-file orchestrator for common reconnaissance pip
 8. Pipeline of your favourite tools: <img width="1922" height="990" alt="image" src="https://github.com/user-attachments/assets/abea5578-1e36-4501-a21d-262602189463" />
 9. Flow overview: <img width="1689" height="877" alt="image" src="https://github.com/user-attachments/assets/501e65b0-d6d5-48ca-bc37-e38663c0ae86" />
 10. Detailed subdomain pages: <img width="910" height="813" alt="image" src="https://github.com/user-attachments/assets/7319fb1c-53b2-49be-808f-2c388c32d3bf" />
-11. Add your own flags to the tools: <img width="1882" height="980" alt="image" src="https://github.com/user-attachments/assets/e55cf545-cb68-4796-b7f2-531cab71691f" />
+11. Add your own flags to the tools: <img width="1882" height="980" alt="image" src="https://github.com/user-attachments/assets/e55cf545-cb68-4796-b7f2-531cab71691f" />]
+12. Endpoint enum: <img width="1235" height="808" alt="image" src="https://github.com/user-attachments/assets/91c74810-42a2-46b3-87df-2e604348338d" />
+
 
 ## Usage
 
