@@ -7,13 +7,17 @@ Recon Command Center is a single-file orchestrator for common reconnaissance pip
 - **Full pipeline automation** – Amass/Subfinder/Assetfinder/Findomain/Sublist3r feed ffuf, httpx, screenshot capture, nuclei, and nikto in one go.
 - **Stateful & resumable** – Results live in `recon_data/state.json`, so re-running a target picks up exactly where it left off. Jobs can be paused/resumed live.
 - **Live dashboard** – A modern SPA served from `main.py` tracks jobs, queue, worker slots, tool availability, and detailed per-program reports.
+- **System Logs** – Dedicated logs view with advanced filtering (by source, level, text search) and sorting. Filter preferences persist between reloads.
 - **Actionable reports** – Each target gets a dedicated page with sortable/filterable tables, paginated views, per-tool sections, command history, severity badges, and a progress overview.
 - **Command history & exports** – Every command executed is logged; you can export JSON or CSV snapshots at any time.
 - **Monitors** – Point the UI at a newline-delimited URL (supports wildcards like `*.corp.com` or `corp.*`). The monitor polls the file, launches new jobs when entries appear, and surfaces health/status in its own tab.
 - **Concurrency controls** – Configure max running jobs and per-tool worker caps so scans behave on your box.
 - **Auto-install helpers** – Best-effort installers kick in when a required tool is missing.
+- **Docker support** – Multi-platform Docker container with all tools pre-installed. Works on Linux (amd64, arm64, armv7).
 
 ## Usage
+
+### Native Installation
 
 ```bash
 # Launch the web UI (default: http://127.0.0.1:8342)
@@ -27,14 +31,35 @@ python3 main.py 'acme.*'        # expands using Settings ➜ wildcard TLDs
 python3 main.py '*.apps.acme.com'
 ```
 
+### Docker Installation
+
+The easiest way to get started with all tools pre-installed:
+
+```bash
+# Build the container (see DOCKER_BUILD.md for Mac-specific instructions)
+docker build -t subscraper:latest .
+
+# Run the container
+docker run -d \
+  --name subscraper \
+  -p 8342:8342 \
+  -v $(pwd)/recon_data:/app/recon_data \
+  subscraper:latest
+
+# Access the web interface at http://localhost:8342
+```
+
+For detailed Docker build instructions including multi-platform builds for Mac, see [DOCKER_BUILD.md](DOCKER_BUILD.md).
+
 Inside the UI you can:
 
 1. Launch new jobs from the Overview module.
 2. Pause/resume running jobs in the Jobs module.
 3. Inspect tool/worker utilization in Workers.
-4. Drill into the revamped Reports page to see per-program progress, completed vs pending steps, collapsible per-tool sections, paginated tables, and the max-severity badge.
-5. Configure monitoring feeds under the Monitors tab – each monitor shows polling health, last fetch, number of pending entries, and per-entry dispatch status.
-6. Export raw data or tweak defaults in Settings (concurrency, wordlists, skip flags, wildcard TLD expansion, etc.).
+4. View system logs with filtering and sorting in the Logs tab (filter by source, level, or search text).
+5. Drill into the revamped Reports page to see per-program progress, completed vs pending steps, collapsible per-tool sections, paginated tables, and the max-severity badge.
+6. Configure monitoring feeds under the Monitors tab – each monitor shows polling health, last fetch, number of pending entries, and per-entry dispatch status.
+7. Export raw data or tweak defaults in Settings (concurrency, wordlists, skip flags, wildcard TLD expansion, etc.).
 
 All output (jsonl history, tool artifacts, screenshots, monitor metadata) lives under `recon_data/`, making it easy to version, sync, or analyze with other tooling.
 

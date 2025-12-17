@@ -2,3 +2,6 @@
 *.json
 *.txt
 *.jsonl
+__pycache__/
+recon_data/
+.DS_Store
