@@ -3475,6 +3475,9 @@ button:hover { background:#1d4ed8; }
 .settings-tab.active { background:#0f172a; color:#fbbf24; border-bottom:2px solid #fbbf24; }
 .settings-subtab-content { display:none; }
 .settings-subtab-content.active { display:block; }
+.error-source { color:#f87171; font-weight:600; }
+.sort-indicator { margin-left:4px; font-size:10px; color:var(--muted); }
+.filter-bar select, .filter-bar input[type="search"] { width:100%; padding:8px; border-radius:8px; border:1px solid #1f2937; background:#0b152c; color:var(--text); }
 @media (max-width: 900px) {
   .app-shell { flex-direction:column; }
   .sidebar { width:100%; height:auto; position:relative; }
@@ -3498,6 +3501,7 @@ button:hover { background:#1d4ed8; }
       <a class="nav-link" data-view="workers" href="#workers">Workers</a>
       <a class="nav-link" data-view="queue" href="#queue">Queue</a>
       <a class="nav-link" data-view="reports" href="#reports">Reports</a>
+      <a class="nav-link" data-view="logs" href="#logs">Logs</a>
       <a class="nav-link" data-view="monitors" href="#monitors">Monitors</a>
       <a class="nav-link" data-view="targets" href="#targets">Targets</a>
       <a class="nav-link" data-view="settings" href="#settings">Settings</a>
@@ -3604,6 +3608,59 @@ button:hover { background:#1d4ed8; }
       <div class="module-header"><h2>Reports & Export</h2></div>
       <div class="module-body" id="reports-body">
         <div class="section-placeholder">No data yet.</div>
+      </div>
+    </section>
+
+    <section class="module" data-view="logs">
+      <div class="module-header">
+        <h2>System Logs</h2>
+        <p class="muted">View all system logs with advanced filtering and sorting</p>
+      </div>
+      <div class="module-body">
+        <div class="card" style="margin-bottom: 20px;">
+          <h3>Filter & Search</h3>
+          <div class="filter-bar" style="display: flex; gap: 12px; flex-wrap: wrap; align-items: end;">
+            <label style="flex: 1; min-width: 200px;">
+              Search logs
+              <input type="search" id="log-search" placeholder="Search by text..." />
+            </label>
+            <label style="flex: 0 0 auto; min-width: 150px;">
+              Source
+              <select id="log-source-filter">
+                <option value="">All sources</option>
+              </select>
+            </label>
+            <label style="flex: 0 0 auto; min-width: 120px;">
+              Level
+              <select id="log-level-filter">
+                <option value="">All levels</option>
+                <option value="system">System</option>
+                <option value="command">Command</option>
+                <option value="error">Error</option>
+                <option value="stderr">Stderr</option>
+              </select>
+            </label>
+            <button id="log-clear-filters" class="btn small">Clear Filters</button>
+          </div>
+        </div>
+        <div class="table-wrapper">
+          <table class="targets-table" id="logs-table">
+            <thead>
+              <tr>
+                <th data-sort-key="timestamp" data-sort-type="text">Timestamp <span class="sort-indicator"></span></th>
+                <th data-sort-key="source" data-sort-type="text">Source <span class="sort-indicator"></span></th>
+                <th data-sort-key="text" data-sort-type="text">Message <span class="sort-indicator"></span></th>
+              </tr>
+            </thead>
+            <tbody id="logs-tbody">
+              <tr><td colspan="3" class="muted">Loading logs...</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-pagination" id="logs-pagination"></div>
+        <div style="margin-top: 16px; text-align: right;">
+          <span class="muted" id="logs-count">0 logs</span>
+        </div>
       </div>
     </section>
 
@@ -3910,6 +3967,11 @@ function setView(target) {
   viewSections.forEach(section => section.classList.toggle('active', section.dataset.view === next));
   navLinks.forEach(link => link.classList.toggle('active', link.dataset.view === next));
   history.replaceState(null, '', `#${next}`);
+  
+  // Update logs when switching to logs view
+  if (next === 'logs') {
+    updateLogsView();
+  }
 }
 navLinks.forEach(link => {
   link.addEventListener('click', (event) => {
@@ -4015,6 +4077,16 @@ const statSubs = document.getElementById('stat-subdomains');
 let launchFormDirty = false;
 let settingsFormDirty = false;
 let monitorsData = [];
+let allLogs = [];
+let filteredLogs = [];
+const logsTable = document.getElementById('logs-table');
+const logsTbody = document.getElementById('logs-tbody');
+const logsPagination = document.getElementById('logs-pagination');
+const logsCount = document.getElementById('logs-count');
+const logSearch = document.getElementById('log-search');
+const logSourceFilter = document.getElementById('log-source-filter');
+const logLevelFilter = document.getElementById('log-level-filter');
+const logClearFilters = document.getElementById('log-clear-filters');
 const STEP_SEQUENCE = [
   { flag: 'amass_done', label: 'Amass' },
   { flag: 'subfinder_done', label: 'Subfinder' },
@@ -5716,6 +5788,7 @@ async function fetchState() {
     latestConfig = data.config || {};
     latestRunningJobs = data.running_jobs || [];
     latestQueuedJobs = data.queued_jobs || [];
+    latestTargetsData = data.targets || {};
     document.getElementById('last-updated').textContent = 'Last updated: ' + (data.last_updated || 'never');
     renderJobs(data.running_jobs || []);
     renderQueue(data.queued_jobs || []);
@@ -5724,6 +5797,12 @@ async function fetchState() {
     renderWorkers(data.workers || {});
     renderReports(data.targets || {});
     renderMonitors(data.monitors || []);
+    
+    // Update logs view if visible
+    const logsSection = document.querySelector('[data-view="logs"]');
+    if (logsSection && logsSection.classList.contains('active')) {
+      await updateLogsView();
+    }
   } catch (err) {
     targetsList.innerHTML = `<div class="section-placeholder">${escapeHtml(err.message)}</div>`;
   }
@@ -5880,6 +5959,211 @@ if (monitorsList) {
     }
   });
 }
+
+// ================== LOGS VIEW ==================
+
+function saveLogFilters() {
+  const filters = {
+    search: logSearch ? logSearch.value : '',
+    source: logSourceFilter ? logSourceFilter.value : '',
+    level: logLevelFilter ? logLevelFilter.value : ''
+  };
+  try {
+    localStorage.setItem('logFilters', JSON.stringify(filters));
+  } catch (e) {
+    // Ignore localStorage errors
+  }
+}
+
+function loadLogFilters() {
+  try {
+    const saved = localStorage.getItem('logFilters');
+    if (saved) {
+      const filters = JSON.parse(saved);
+      if (logSearch) logSearch.value = filters.search || '';
+      if (logSourceFilter) logSourceFilter.value = filters.source || '';
+      if (logLevelFilter) logLevelFilter.value = filters.level || '';
+      return filters;
+    }
+  } catch (e) {
+    // Ignore localStorage errors
+  }
+  return { search: '', source: '', level: '' };
+}
+
+async function fetchAllLogs() {
+  // Collect logs from all running jobs and history
+  let logs = [];
+  
+  // Get logs from currently running jobs
+  latestRunningJobs.forEach(job => {
+    const jobLogs = job.logs || [];
+    jobLogs.forEach(entry => {
+      logs.push({
+        timestamp: entry.ts || '',
+        source: entry.source || 'unknown',
+        text: entry.text || '',
+        domain: job.domain || ''
+      });
+    });
+  });
+  
+  // Get logs from history for all targets
+  const targets = Object.keys(latestTargetsData);
+  for (const domain of targets) {
+    try {
+      const resp = await fetch(`/api/history?domain=${encodeURIComponent(domain)}`);
+      if (resp.ok) {
+        const data = await resp.json();
+        const events = data.events || [];
+        events.forEach(entry => {
+          logs.push({
+            timestamp: entry.ts || '',
+            source: entry.source || 'unknown',
+            text: entry.text || '',
+            domain: domain
+          });
+        });
+      }
+    } catch (err) {
+      // Ignore fetch errors for individual domains
+    }
+  }
+  
+  // Sort by timestamp descending (newest first)
+  logs.sort((a, b) => {
+    const dateA = new Date(a.timestamp || 0);
+    const dateB = new Date(b.timestamp || 0);
+    return dateB - dateA;
+  });
+  
+  return logs;
+}
+
+function filterLogs() {
+  const searchTerm = (logSearch ? logSearch.value : '').toLowerCase();
+  const sourceFilter = logSourceFilter ? logSourceFilter.value : '';
+  const levelFilter = logLevelFilter ? logLevelFilter.value : '';
+  
+  filteredLogs = allLogs.filter(log => {
+    // Text search
+    if (searchTerm && !log.text.toLowerCase().includes(searchTerm) && !log.domain.toLowerCase().includes(searchTerm)) {
+      return false;
+    }
+    
+    // Source filter
+    if (sourceFilter && log.source !== sourceFilter) {
+      return false;
+    }
+    
+    // Level filter (matches source for common cases)
+    if (levelFilter) {
+      const source = log.source.toLowerCase();
+      if (levelFilter === 'error' && !source.includes('error')) {
+        return false;
+      }
+      if (levelFilter === 'stderr' && !source.includes('stderr')) {
+        return false;
+      }
+      if (levelFilter === 'command' && !log.text.startsWith('$')) {
+        return false;
+      }
+      if (levelFilter === 'system' && source !== 'system' && source !== 'scheduler') {
+        return false;
+      }
+    }
+    
+    return true;
+  });
+  
+  saveLogFilters();
+  renderLogs();
+}
+
+function renderLogs() {
+  if (!logsTbody) return;
+  
+  if (filteredLogs.length === 0) {
+    logsTbody.innerHTML = '<tr><td colspan="3" class="muted">No logs match your filters.</td></tr>';
+    if (logsCount) logsCount.textContent = '0 logs';
+    return;
+  }
+  
+  const rows = filteredLogs.map(log => {
+    const timestamp = fmtTime(log.timestamp);
+    const sourceClass = log.source.toLowerCase().includes('error') || log.source.toLowerCase().includes('stderr') ? 'error-source' : '';
+    return `
+      <tr>
+        <td data-sort-value="${escapeHtml(log.timestamp)}">${escapeHtml(timestamp)}</td>
+        <td data-sort-value="${escapeHtml(log.source)}" class="${sourceClass}">
+          <span title="${escapeHtml(log.domain)}">${escapeHtml(log.source)}</span>
+        </td>
+        <td data-sort-value="${escapeHtml(log.text)}" style="max-width: 600px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(log.text)}">
+          ${escapeHtml(log.text)}
+        </td>
+      </tr>
+    `;
+  }).join('');
+  
+  logsTbody.innerHTML = rows;
+  if (logsCount) logsCount.textContent = `${filteredLogs.length} logs (of ${allLogs.length} total)`;
+  
+  // Apply pagination if available
+  if (logsPagination && logsTable) {
+    initPagination(logsTable, logsPagination, DEFAULT_PAGE_SIZE);
+  }
+}
+
+function populateLogSourceFilter() {
+  if (!logSourceFilter) return;
+  
+  const sources = new Set();
+  allLogs.forEach(log => {
+    if (log.source) sources.add(log.source);
+  });
+  
+  const currentValue = logSourceFilter.value;
+  const sortedSources = Array.from(sources).sort();
+  
+  logSourceFilter.innerHTML = '<option value="">All sources</option>' +
+    sortedSources.map(source => `<option value="${escapeHtml(source)}">${escapeHtml(source)}</option>`).join('');
+  
+  // Restore previous selection if it still exists
+  if (currentValue && sortedSources.includes(currentValue)) {
+    logSourceFilter.value = currentValue;
+  }
+}
+
+async function updateLogsView() {
+  allLogs = await fetchAllLogs();
+  populateLogSourceFilter();
+  filterLogs();
+}
+
+// Event listeners for logs
+if (logSearch) {
+  logSearch.addEventListener('input', filterLogs);
+}
+
+if (logSourceFilter) {
+  logSourceFilter.addEventListener('change', filterLogs);
+}
+
+if (logLevelFilter) {
+  logLevelFilter.addEventListener('change', filterLogs);
+}
+
+if (logClearFilters) {
+  logClearFilters.addEventListener('click', () => {
+    if (logSearch) logSearch.value = '';
+    if (logSourceFilter) logSourceFilter.value = '';
+    if (logLevelFilter) logLevelFilter.value = '';
+    filterLogs();
+  });
+}
+
+// Load saved filters on page load
+loadLogFilters();
 
 renderWorkflowDiagram();
 fetchState();
