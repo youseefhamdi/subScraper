@@ -16,6 +16,18 @@ Recon Command Center is a single-file orchestrator for common reconnaissance pip
 - **Auto-install helpers** – Best-effort installers kick in when a required tool is missing.
 - **Docker support** – Multi-platform Docker container with all tools pre-installed. Works on Linux (amd64, arm64, armv7).
 
+1. Dynamic queue management to fit YOUR pc: <img width="1055" height="976" alt="image" src="https://github.com/user-attachments/assets/c59393dd-2036-411e-b082-13c7f21241a4" />
+2. Auto backup + backup and restore: <img width="1881" height="973" alt="image" src="https://github.com/user-attachments/assets/8fc07597-c205-48de-b4d7-d6399a2a70da" />
+3. Enter a domain or wildcard domain: <img width="933" height="312" alt="image" src="https://github.com/user-attachments/assets/8ced9ef3-2637-402f-9834-0a2698f5ef1d" />
+4. Get a detailed report: <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/5b3e6db4-6a9b-4d37-993d-4b44d1f74273" />
+5. A screenshot gallery: <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/1d025fd0-5fb5-4e9c-abaa-819998c27e09" />
+6. Full logging and monitoring: <img width="1901" height="979" alt="image" src="https://github.com/user-attachments/assets/b1afb276-2f1e-491a-8209-58670db5e7e4" />
+7. Monitoring your system so you can make sure not to overload it: <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/09c9639e-baf3-425c-af78-5fe24280cf4c" />
+8. Pipeline of your favourite tools: <img width="1922" height="990" alt="image" src="https://github.com/user-attachments/assets/abea5578-1e36-4501-a21d-262602189463" />
+9. Flow overview: <img width="1689" height="877" alt="image" src="https://github.com/user-attachments/assets/501e65b0-d6d5-48ca-bc37-e38663c0ae86" />
+10. Detailed subdomain pages: <img width="910" height="813" alt="image" src="https://github.com/user-attachments/assets/7319fb1c-53b2-49be-808f-2c388c32d3bf" />
+11. Add your own flags to the tools: <img width="1882" height="980" alt="image" src="https://github.com/user-attachments/assets/e55cf545-cb68-4796-b7f2-531cab71691f" />
+
 ## Usage
 
 ### Native Installation
