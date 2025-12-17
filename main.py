@@ -790,9 +790,9 @@ def collect_system_resources() -> Dict[str, Any]:
         cpu_count_logical = psutil.cpu_count(logical=True)
         cpu_count_physical = psutil.cpu_count(logical=False)
         
-        # CPU metrics
-        cpu_percent = psutil.cpu_percent(interval=0.1)
-        cpu_per_core = psutil.cpu_percent(interval=0.1, percpu=True)
+        # CPU metrics (use interval=None for non-blocking measurement based on previous call)
+        cpu_percent = psutil.cpu_percent(interval=None)
+        cpu_per_core = psutil.cpu_percent(interval=None, percpu=True)
         cpu_freq = psutil.cpu_freq()
         load_avg = psutil.getloadavg() if hasattr(psutil, 'getloadavg') else (0, 0, 0)
         
@@ -813,21 +813,21 @@ def collect_system_resources() -> Dict[str, Any]:
             children = current_process.children(recursive=True)
             process_count = 1 + len(children)
             
-            # Sum up resources for main process and children
-            total_process_cpu = current_process.cpu_percent(interval=0.1)
+            # Sum up resources for main process and children (use interval=None)
+            total_process_cpu = current_process.cpu_percent(interval=None)
             total_process_mem = current_process.memory_info().rss
             total_process_threads = current_process.num_threads()
             
             for child in children:
                 try:
-                    total_process_cpu += child.cpu_percent(interval=0.1)
+                    total_process_cpu += child.cpu_percent(interval=None)
                     total_process_mem += child.memory_info().rss
                     total_process_threads += child.num_threads()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             process_count = 1
-            total_process_cpu = current_process.cpu_percent(interval=0.1)
+            total_process_cpu = current_process.cpu_percent(interval=None)
             total_process_mem = current_process.memory_info().rss
             total_process_threads = current_process.num_threads()
         
